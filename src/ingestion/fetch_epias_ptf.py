@@ -16,8 +16,16 @@ MCP_URL = "https://seffaflik.epias.com.tr/electricity-service/v1/markets/dam/dat
 
 OUT_DIR = "data/raw/epias/ptf_mcp"
 DEFAULT_START_DATE = "2018-01-01"
-CHUNK_DAYS = 30
+
+CHUNK_DAYS = 7
 OVERLAP_DAYS = 1
+
+MAX_RETRIES = 5
+RATE_LIMIT_WAIT_SECONDS = 65
+REQUEST_SLEEP_SECONDS = 2
+ERROR_SLEEP_SECONDS = 5
+
+MANUAL_RANGES: list[tuple[str, str]] | None = None
 
 
 def get_tgt(username: str, password: str) -> str:
@@ -122,6 +130,11 @@ def write_parquet_partitioned(df: pd.DataFrame, out_dir: str | Path) -> int:
     ts_col = detect_timestamp_column(df)
 
     if ts_col is not None:
+        df = df.dropna(subset=[ts_col])
+
+        if df.empty:
+            return 0
+
         df["year"] = df[ts_col].dt.year.astype("int16")
         df["month"] = df[ts_col].dt.month.astype("int8")
     else:
@@ -202,24 +215,115 @@ def should_fetch(start_date: str, end_date: str) -> bool:
     return pd.Timestamp(start_date) <= pd.Timestamp(end_date)
 
 
-def main() -> None:
-    username = os.getenv("EPIAS_USERNAME")
-    password = os.getenv("EPIAS_PASSWORD")
+def build_fetch_ranges(
+    out_dir: str | Path,
+    default_start_date: str,
+    overlap_days: int,
+) -> list[tuple[str, str]]:
+    if MANUAL_RANGES:
+        print("Manual ranges mode is ACTIVE.")
+        ranges: list[tuple[str, str]] = []
 
-    if not username or not password:
-        raise RuntimeError("EPIAS_USERNAME ve EPIAS_PASSWORD Invalid")
+        for rs, re in MANUAL_RANGES:
+            for s, e in daterange_chunks(rs, re, CHUNK_DAYS):
+                ranges.append((s, e))
+
+        return ranges
 
     start_date, end_date = resolve_fetch_window(
-        out_dir=OUT_DIR,
-        default_start_date=DEFAULT_START_DATE,
-        overlap_days=OVERLAP_DAYS,
+        out_dir=out_dir,
+        default_start_date=default_start_date,
+        overlap_days=overlap_days,
     )
 
     print(f"Resolved fetch window: {start_date} -> {end_date}")
 
     if not should_fetch(start_date, end_date):
+        return []
+
+    return list(daterange_chunks(start_date, end_date, CHUNK_DAYS))
+
+
+def fetch_single_chunk(
+    start_date: str,
+    end_date: str,
+    tgt: str,
+    username: str,
+    password: str,
+) -> tuple[bool, int, str]:
+    """
+    Returns:
+        success: bool
+        written_rows: int
+        tgt: possibly renewed tgt
+    """
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            print(f"Fetching: {start_date} -> {end_date} | attempt={attempt}/{MAX_RETRIES}")
+
+            raw = fetch_mcp_raw(start_date, end_date, tgt)
+            df = raw_to_df(raw, start_date, end_date)
+
+            if df.empty:
+                print("  No rows returned for this chunk.")
+                time.sleep(REQUEST_SLEEP_SECONDS)
+                return True, 0, tgt
+
+            written = write_parquet_partitioned(df, OUT_DIR)
+            print(f"  WROTE {written} rows to parquet dataset: {OUT_DIR}")
+
+            time.sleep(REQUEST_SLEEP_SECONDS)
+            return True, written, tgt
+
+        except requests.HTTPError as ex:
+            status = ex.response.status_code if ex.response is not None else None
+
+            if status == 429:
+                print(
+                    f"  429 rate limit on {start_date}->{end_date}. "
+                    f"Waiting {RATE_LIMIT_WAIT_SECONDS} seconds..."
+                )
+                time.sleep(RATE_LIMIT_WAIT_SECONDS)
+                continue
+
+            if status in (401, 403):
+                print("  Auth issue detected. Renewing TGT...")
+                tgt = get_tgt(username, password)
+                time.sleep(3)
+                continue
+
+            print(f"  HTTPError on {start_date}->{end_date}: {ex}")
+            time.sleep(ERROR_SLEEP_SECONDS)
+
+        except requests.RequestException as ex:
+            print(f"  RequestException on {start_date}->{end_date}: {ex}")
+            time.sleep(ERROR_SLEEP_SECONDS)
+
+        except Exception as ex:
+            print(f"  Error on {start_date}->{end_date}: {ex}")
+            time.sleep(ERROR_SLEEP_SECONDS)
+
+    return False, 0, tgt
+
+
+def main() -> None:
+    username = os.getenv("EPIAS_USERNAME")
+    password = os.getenv("EPIAS_PASSWORD")
+
+    if not username or not password:
+        raise RuntimeError("EPIAS_USERNAME ve EPIAS_PASSWORD invalid")
+
+    ranges = build_fetch_ranges(
+        out_dir=OUT_DIR,
+        default_start_date=DEFAULT_START_DATE,
+        overlap_days=OVERLAP_DAYS,
+    )
+
+    if not ranges:
         print("No new data to fetch. Exiting.")
         return
+
+    print(f"Total chunk count: {len(ranges)}")
 
     tgt = get_tgt(username, password)
     print("TGT OK")
@@ -227,39 +331,33 @@ def main() -> None:
     ok_chunks = 0
     fail_chunks = 0
     total_rows = 0
+    failed_ranges: list[tuple[str, str]] = []
 
-    for s, e in daterange_chunks(start_date, end_date, chunk_days=CHUNK_DAYS):
-        try:
-            print(f"Fetching: {s} -> {e}")
+    for s, e in ranges:
+        success, written, tgt = fetch_single_chunk(
+            start_date=s,
+            end_date=e,
+            tgt=tgt,
+            username=username,
+            password=password,
+        )
 
-            raw = fetch_mcp_raw(s, e, tgt)
-            df = raw_to_df(raw, s, e)
-
-            if df.empty:
-                print("  No rows returned for this chunk.")
-                ok_chunks += 1
-                continue
-
-            written = write_parquet_partitioned(df, OUT_DIR)
-
-            print(f"  WROTE {written} rows to parquet dataset: {OUT_DIR}")
-            total_rows += written
+        if success:
             ok_chunks += 1
-
-            time.sleep(0.2)
-
-        except requests.HTTPError as ex:
+            total_rows += written
+        else:
             fail_chunks += 1
-            print(f"  FAILED: {s} -> {e} | HTTPError: {ex}")
-            continue
+            failed_ranges.append((s, e))
 
-        except Exception as ex:
-            fail_chunks += 1
-            print(f"  FAILED: {s} -> {e} | Error: {ex}")
-            continue
+    print("\nFAILED RANGES:")
+    if failed_ranges:
+        for fr in failed_ranges:
+            print(fr)
+    else:
+        print("None")
 
     print(
-        f"DONE. OK_CHUNKS={ok_chunks}, "
+        f"\nDONE. OK_CHUNKS={ok_chunks}, "
         f"FAIL_CHUNKS={fail_chunks}, "
         f"TOTAL_ROWS={total_rows}"
     )
