@@ -1,28 +1,36 @@
+from __future__ import annotations
+
+import argparse
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
 
 PROCESSED_PATH = Path("data/processed/ptf/ptf_processed.parquet")
-FEATURES_PATH = Path("data/features/ptf/ptf_features.parquet")
+
+TRAIN_FEATURES_PATH = Path("data/features/ptf/ptf_features.parquet")
+INFERENCE_LATEST_PATH = Path("data/features/ptf/ptf_features_inference_latest.parquet")
+INFERENCE_BACKFILL_PATH = Path("data/features/ptf/ptf_features_inference_backfill.parquet")
 
 TARGET_HORIZON = 24
 
 LAGS = [1, 3, 24, 48, 72, 168, 336]
 ROLLING_WINDOWS = [24, 168]
 
+DATE_COL = "date"
+TARGET_COL = "target"
+
 
 def load_processed_data(path: str | Path) -> pd.DataFrame:
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Processed parquet not found: {path}")
-
-    df = pd.read_parquet(path)
-    return df
+    return pd.read_parquet(path)
 
 
 def validate_required_columns(df: pd.DataFrame) -> None:
-    required_cols = ["date", "ptf", "priceusd", "priceeur"]
+    required_cols = [DATE_COL, "ptf", "priceusd", "priceeur"]
     missing_cols = [col for col in required_cols if col not in df.columns]
 
     if missing_cols:
@@ -32,15 +40,16 @@ def validate_required_columns(df: pd.DataFrame) -> None:
 def prepare_base_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
     df["ptf"] = pd.to_numeric(df["ptf"], errors="coerce")
     df["priceusd"] = pd.to_numeric(df["priceusd"], errors="coerce")
     df["priceeur"] = pd.to_numeric(df["priceeur"], errors="coerce")
 
-    df = df.dropna(subset=["date", "ptf"])
-    df = df.sort_values("date")
-    df = df.drop_duplicates(subset=["date"], keep="first")
-    df = df.set_index("date")
+    df = df.dropna(subset=[DATE_COL, "ptf"]).copy()
+    df = df.sort_values(DATE_COL)
+    df = df.drop_duplicates(subset=[DATE_COL], keep="first")
+    df = df.set_index(DATE_COL)
+    df = df.sort_index()
 
     return df
 
@@ -121,7 +130,6 @@ def add_clipped_features(df: pd.DataFrame) -> pd.DataFrame:
 
     df["rolling_mean_24_clipped"] = base_clipped.rolling(24).mean()
     df["rolling_mean_168_clipped"] = base_clipped.rolling(168).mean()
-
     df["rolling_std_24_clipped"] = base_clipped.rolling(24).std()
     df["rolling_std_168_clipped"] = base_clipped.rolling(168).std()
 
@@ -147,20 +155,14 @@ def add_spike_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def add_target(df: pd.DataFrame, horizon: int = 24) -> pd.DataFrame:
+def add_target(df: pd.DataFrame, horizon: int = TARGET_HORIZON) -> pd.DataFrame:
     df = df.copy()
-    df["target"] = df["ptf"].shift(-horizon)
-    return df
-
-
-def finalize_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df = df.dropna()
+    df[TARGET_COL] = df["ptf"].shift(-horizon)
     return df
 
 
 def build_feature_list() -> list[str]:
-    feature_cols = [
+    return [
         "hour",
         "day_of_week",
         "is_weekend",
@@ -168,10 +170,8 @@ def build_feature_list() -> list[str]:
         "hour_cos",
         "dow_sin",
         "dow_cos",
-
         "ptf_usd_ratio",
         "ptf_eur_ratio",
-
         "lag_1",
         "lag_3",
         "lag_24",
@@ -179,7 +179,6 @@ def build_feature_list() -> list[str]:
         "lag_72",
         "lag_168",
         "lag_336",
-
         "rolling_mean_24",
         "rolling_std_24",
         "rolling_min_24",
@@ -188,24 +187,70 @@ def build_feature_list() -> list[str]:
         "rolling_std_168",
         "rolling_min_168",
         "rolling_max_168",
-
         "diff_1",
         "diff_24",
         "diff_168",
-
         "lag_24_clipped",
         "lag_168_clipped",
         "rolling_mean_24_clipped",
         "rolling_mean_168_clipped",
         "rolling_std_24_clipped",
         "rolling_std_168_clipped",
-
         "spike_high",
         "spike_low",
         "spike_jump_24",
         "spike_jump_168",
     ]
-    return feature_cols
+
+
+def validate_engineered_features(df: pd.DataFrame, feature_cols: list[str]) -> None:
+    missing_feature_cols = [col for col in feature_cols if col not in df.columns]
+    if missing_feature_cols:
+        raise ValueError(f"Missing engineered feature columns: {missing_feature_cols}")
+
+
+def finalize_train_features(df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
+    df = df.copy()
+
+    required_cols = feature_cols + [TARGET_COL]
+    df = df.dropna(subset=required_cols).copy()
+    df = df.reset_index()
+
+    final_cols = [DATE_COL] + feature_cols + [TARGET_COL]
+    return df[final_cols].copy()
+
+
+def finalize_inference_latest_features(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+) -> pd.DataFrame:
+    df = df.copy()
+
+    df = df.dropna(subset=feature_cols).copy()
+    if df.empty:
+        raise ValueError("No valid rows found for inference_latest after feature NaN filtering.")
+
+    df = df.tail(1).copy()
+    df = df.reset_index()
+
+    final_cols = [DATE_COL] + feature_cols
+    return df[final_cols].copy()
+
+
+def finalize_inference_backfill_features(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+) -> pd.DataFrame:
+    df = df.copy()
+
+    df = df.dropna(subset=feature_cols).copy()
+    if df.empty:
+        raise ValueError("No valid rows found for inference_backfill after feature NaN filtering.")
+
+    df = df.reset_index()
+
+    final_cols = [DATE_COL] + feature_cols
+    return df[final_cols].copy()
 
 
 def save_features(df: pd.DataFrame, path: str | Path) -> None:
@@ -216,11 +261,11 @@ def save_features(df: pd.DataFrame, path: str | Path) -> None:
         path,
         engine="pyarrow",
         compression="snappy",
-        index=True,
+        index=False,
     )
 
 
-def main() -> None:
+def run_feature_pipeline(mode: str) -> None:
     print("Loading processed data...")
     df = load_processed_data(PROCESSED_PATH)
 
@@ -251,31 +296,65 @@ def main() -> None:
     print("Adding spike features...")
     df = add_spike_features(df)
 
-    print("Adding target...")
-    df = add_target(df, horizon=TARGET_HORIZON)
-
-    print("Dropping rows with NaN values...")
-    df = finalize_features(df)
-
     feature_cols = build_feature_list()
-    target_col = "target"
+    validate_engineered_features(df, feature_cols)
 
-    missing_feature_cols = [col for col in feature_cols if col not in df.columns]
-    if missing_feature_cols:
-        raise ValueError(f"Missing engineered feature columns: {missing_feature_cols}")
+    if mode == "train":
+        print("Adding target...")
+        df = add_target(df, horizon=TARGET_HORIZON)
 
-    final_cols = feature_cols + [target_col]
-    df_final = df[final_cols].copy()
+        print("Finalizing train feature dataset...")
+        df_final = finalize_train_features(df, feature_cols)
+        output_path = TRAIN_FEATURES_PATH
+
+    elif mode == "inference_latest":
+        print("Finalizing latest inference feature dataset...")
+        df_final = finalize_inference_latest_features(df, feature_cols)
+        output_path = INFERENCE_LATEST_PATH
+
+    elif mode == "inference_backfill":
+        print("Finalizing backfill inference feature dataset...")
+        df_final = finalize_inference_backfill_features(df, feature_cols)
+        output_path = INFERENCE_BACKFILL_PATH
+
+    else:
+        raise ValueError(
+            "mode must be one of: train, inference_latest, inference_backfill"
+        )
 
     print("Saving feature dataset...")
-    save_features(df_final, FEATURES_PATH)
+    save_features(df_final, output_path)
 
     print("Done.")
+    print(f"Mode       : {mode}")
     print(f"Final shape: {df_final.shape}")
-    print(f"Saved to: {FEATURES_PATH}")
-    print("Feature columns:")
-    for col in feature_cols:
+    print(f"Saved to   : {output_path}")
+
+    if not df_final.empty and DATE_COL in df_final.columns:
+        print(f"Date range : {df_final[DATE_COL].min()} -> {df_final[DATE_COL].max()}")
+
+    print("Columns:")
+    for col in df_final.columns:
         print(f" - {col}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build PTF features for training or inference."
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        required=True,
+        choices=["train", "inference_latest", "inference_backfill"],
+        help="Feature generation mode.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    run_feature_pipeline(mode=args.mode)
 
 
 if __name__ == "__main__":
