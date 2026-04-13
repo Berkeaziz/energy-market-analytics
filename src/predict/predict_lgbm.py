@@ -175,17 +175,11 @@ def filter_missing_predictions_for_model(
     ) + pd.Timedelta(hours=TARGET_HORIZON_HOURS)
 
     if prediction_store_df.empty:
-        filtered_df = candidate_df.drop(columns=["forecast_time"]).reset_index(drop=True)
-        if filtered_df.empty:
-            raise ValueError("No rows available for auto backfill.")
-        return filtered_df
+        return candidate_df.drop(columns=["forecast_time"]).reset_index(drop=True)
 
     required_cols = {"forecast_time", "model_version"}
     if not required_cols.issubset(prediction_store_df.columns):
-        filtered_df = candidate_df.drop(columns=["forecast_time"]).reset_index(drop=True)
-        if filtered_df.empty:
-            raise ValueError("No rows available for auto backfill.")
-        return filtered_df
+        return candidate_df.drop(columns=["forecast_time"]).reset_index(drop=True)
 
     existing_forecast_times = set(
         prediction_store_df.loc[
@@ -201,12 +195,6 @@ def filter_missing_predictions_for_model(
     ].copy()
 
     filtered_df = filtered_df.drop(columns=["forecast_time"]).reset_index(drop=True)
-
-    if filtered_df.empty:
-        raise ValueError(
-            f"No missing forecast rows found for active model_version={model_version}."
-        )
-
     return filtered_df
 
 
@@ -370,6 +358,13 @@ def main() -> None:
 
     else:
         raise ValueError("Invalid mode.")
+
+    if df.empty:
+        print("No rows to predict. Exiting gracefully.")
+        print(f"Mode                : {args.mode}")
+        print(f"Model version       : {model_version}")
+        print("Reason              : No missing forecast rows found.")
+        return
 
     print("Validating inference features...")
     validate_inference_features(df, feature_cols)
