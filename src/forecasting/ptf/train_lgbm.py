@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import joblib
+import mlflow
+import mlflow.lightgbm
 import numpy as np
 import pandas as pd
 from lightgbm import LGBMRegressor
@@ -29,6 +32,8 @@ BEST_PARAMS_PATH = Path("artifacts/modelling_artifact/ptf_best_params_optuna.jso
 TRAIN_RATIO = 0.70
 VAL_RATIO = 0.15
 TEST_RATIO = 0.15
+
+EXPERIMENT_NAME = "ptf_forecasting_lgbm"
 
 
 def load_best_params(path: str | Path) -> dict[str, Any]:
@@ -157,7 +162,6 @@ def main() -> None:
     print(feature_cols[:15])
 
     train_df, val_df, test_df = chronological_split(df)
-
     train_val_df = pd.concat([train_df, val_df], axis=0).copy()
 
     X_train_val = train_val_df[feature_cols].copy()
@@ -197,81 +201,136 @@ def main() -> None:
     best_params = load_best_params(BEST_PARAMS_PATH)
     print(json.dumps(best_params, indent=2))
 
-    print("\nTraining final LightGBM model on train + val...")
-    model = LGBMRegressor(**best_params)
-    model.fit(X_train_val, y_train_val)
+    print("\nConfiguring MLflow...")
+    mlflow.set_experiment(EXPERIMENT_NAME)
 
-    test_pred = model.predict(X_test)
+    model_version = f"lgbm_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
-    lgbm_test_metrics = evaluate_regression(y_test, test_pred, prefix="test_")
+    with mlflow.start_run(run_name="lightgbm_final_train_val"):
+        mlflow.set_tag("model_version", model_version)
 
-    lgbm_metrics = {
-        "model": "lightgbm_final_train_val",
-        "train_rows": int(len(train_df)),
-        "val_rows": int(len(val_df)),
-        "train_val_rows": int(len(train_val_df)),
-        "test_rows": int(len(test_df)),
-        **lgbm_test_metrics,
-    }
+        mlflow.log_param("model_type", "LGBMRegressor")
+        mlflow.log_param("target_col", TARGET_COL)
+        mlflow.log_param("baseline_col", BASELINE_COL)
+        mlflow.log_param("feature_count", len(feature_cols))
+        mlflow.log_param("train_ratio", TRAIN_RATIO)
+        mlflow.log_param("val_ratio", VAL_RATIO)
+        mlflow.log_param("test_ratio", TEST_RATIO)
+        mlflow.log_param("model_version", model_version)
 
-    print("LightGBM test metrics:")
-    print(json.dumps(lgbm_metrics, indent=2))
+        mlflow.log_params(best_params)
 
-    comparison_df = pd.DataFrame([baseline_metrics, lgbm_metrics])
-    print("\nModel comparison:")
-    print(comparison_df)
+        mlflow.log_metric("train_rows", int(len(train_df)))
+        mlflow.log_metric("val_rows", int(len(val_df)))
+        mlflow.log_metric("train_val_rows", int(len(train_val_df)))
+        mlflow.log_metric("test_rows", int(len(test_df)))
 
-    importance_df = pd.DataFrame(
-        {
-            "feature": feature_cols,
-            "importance": model.feature_importances_,
+        mlflow.log_metric("baseline_test_mae", baseline_metrics["test_mae"])
+        mlflow.log_metric("baseline_test_rmse", baseline_metrics["test_rmse"])
+        if baseline_metrics["test_mape"] is not None:
+            mlflow.log_metric("baseline_test_mape", baseline_metrics["test_mape"])
+
+        print("\nTraining final LightGBM model on train + val...")
+        model = LGBMRegressor(**best_params)
+        model.fit(X_train_val, y_train_val)
+
+        test_pred = model.predict(X_test)
+
+        lgbm_test_metrics = evaluate_regression(y_test, test_pred, prefix="test_")
+
+        lgbm_metrics = {
+            "model": "lightgbm_final_train_val",
+            "model_version": model_version,
+            "train_rows": int(len(train_df)),
+            "val_rows": int(len(val_df)),
+            "train_val_rows": int(len(train_val_df)),
+            "test_rows": int(len(test_df)),
+            **lgbm_test_metrics,
         }
-    ).sort_values("importance", ascending=False)
 
-    print("\nTop 20 feature importances:")
-    print(importance_df.head(20))
+        print("LightGBM test metrics:")
+        print(json.dumps(lgbm_metrics, indent=2))
 
-    print("\nSaving artifacts...")
+        mlflow.log_metric("test_mae", lgbm_metrics["test_mae"])
+        mlflow.log_metric("test_rmse", lgbm_metrics["test_rmse"])
+        if lgbm_metrics["test_mape"] is not None:
+            mlflow.log_metric("test_mape", lgbm_metrics["test_mape"])
 
-    joblib.dump(model, ARTIFACTS_DIR / "lgbm_model.joblib")
+        comparison_df = pd.DataFrame([baseline_metrics, lgbm_metrics])
+        print("\nModel comparison:")
+        print(comparison_df)
 
-    save_json(
-        {"model_path": str(ARTIFACTS_DIR / "lgbm_model.joblib")},
-        ARTIFACTS_DIR / "model_info.json"
-    )
-    comparison_df.to_csv(ARTIFACTS_DIR / "metrics_comparison.csv", index=False)
-    importance_df.to_csv(ARTIFACTS_DIR / "feature_importance.csv", index=False)
+        importance_df = pd.DataFrame(
+            {
+                "feature": feature_cols,
+                "importance": model.feature_importances_,
+            }
+        ).sort_values("importance", ascending=False)
 
-    save_json(baseline_metrics, ARTIFACTS_DIR / "baseline_test_metrics.json")
-    save_json(lgbm_metrics, ARTIFACTS_DIR / "lgbm_test_metrics.json")
-    save_json({"feature_columns": feature_cols}, ARTIFACTS_DIR / "feature_columns.json")
-    save_json(best_params, ARTIFACTS_DIR / "best_params_used.json")
+        print("\nTop 20 feature importances:")
+        print(importance_df.head(20))
 
-    test_pred_df = pd.DataFrame(
-        {
-            "y_true": y_test.values,
-            "y_pred": test_pred,
-            "baseline_pred": test_baseline_pred,
+        print("\nSaving artifacts...")
+
+        model_path = ARTIFACTS_DIR / "lgbm_model.joblib"
+        model_info_path = ARTIFACTS_DIR / "model_info.json"
+
+        joblib.dump(model, model_path)
+
+        save_json(
+            {
+                "model_path": model_path.as_posix(),
+                "model_version": model_version,
+            },
+            model_info_path,
+        )
+
+        comparison_df.to_csv(ARTIFACTS_DIR / "metrics_comparison.csv", index=False)
+        importance_df.to_csv(ARTIFACTS_DIR / "feature_importance.csv", index=False)
+
+        save_json(baseline_metrics, ARTIFACTS_DIR / "baseline_test_metrics.json")
+        save_json(lgbm_metrics, ARTIFACTS_DIR / "lgbm_test_metrics.json")
+        save_json({"feature_columns": feature_cols}, ARTIFACTS_DIR / "feature_columns.json")
+        save_json(best_params, ARTIFACTS_DIR / "best_params_used.json")
+
+        test_pred_df = pd.DataFrame(
+            {
+                "y_true": y_test.values,
+                "y_pred": test_pred,
+                "baseline_pred": test_baseline_pred,
+            }
+        )
+
+        if DATE_COL in test_df.columns:
+            test_pred_df.insert(0, DATE_COL, test_df[DATE_COL].values)
+
+        test_pred_df.to_csv(ARTIFACTS_DIR / "test_predictions.csv", index=False)
+
+        split_summary = {
+            "train_start": str(train_df[DATE_COL].min()) if DATE_COL in train_df.columns else None,
+            "train_end": str(train_df[DATE_COL].max()) if DATE_COL in train_df.columns else None,
+            "val_start": str(val_df[DATE_COL].min()) if DATE_COL in val_df.columns else None,
+            "val_end": str(val_df[DATE_COL].max()) if DATE_COL in val_df.columns else None,
+            "test_start": str(test_df[DATE_COL].min()) if DATE_COL in test_df.columns else None,
+            "test_end": str(test_df[DATE_COL].max()) if DATE_COL in test_df.columns else None,
         }
-    )
+        save_json(split_summary, ARTIFACTS_DIR / "split_summary.json")
 
-    if DATE_COL in test_df.columns:
-        test_pred_df.insert(0, DATE_COL, test_df[DATE_COL].values)
+        mlflow.log_artifact(str(model_info_path))
+        mlflow.log_artifact(str(ARTIFACTS_DIR / "baseline_test_metrics.json"))
+        mlflow.log_artifact(str(ARTIFACTS_DIR / "lgbm_test_metrics.json"))
+        mlflow.log_artifact(str(ARTIFACTS_DIR / "feature_columns.json"))
+        mlflow.log_artifact(str(ARTIFACTS_DIR / "best_params_used.json"))
+        mlflow.log_artifact(str(ARTIFACTS_DIR / "split_summary.json"))
+        mlflow.log_artifact(str(ARTIFACTS_DIR / "metrics_comparison.csv"))
+        mlflow.log_artifact(str(ARTIFACTS_DIR / "feature_importance.csv"))
+        mlflow.log_artifact(str(ARTIFACTS_DIR / "test_predictions.csv"))
+        mlflow.log_artifact(str(model_path))
 
-    test_pred_df.to_csv(ARTIFACTS_DIR / "test_predictions.csv", index=False)
-
-    train_val_info = {
-        "train_start": str(train_df[DATE_COL].min()) if DATE_COL in train_df.columns else None,
-        "train_end": str(train_df[DATE_COL].max()) if DATE_COL in train_df.columns else None,
-        "val_start": str(val_df[DATE_COL].min()) if DATE_COL in val_df.columns else None,
-        "val_end": str(val_df[DATE_COL].max()) if DATE_COL in val_df.columns else None,
-        "test_start": str(test_df[DATE_COL].min()) if DATE_COL in test_df.columns else None,
-        "test_end": str(test_df[DATE_COL].max()) if DATE_COL in test_df.columns else None,
-    }
-    save_json(train_val_info, ARTIFACTS_DIR / "split_summary.json")
-
-    print("Done.")
-    print(f"Artifacts saved to: {ARTIFACTS_DIR.resolve()}")
+        print("Done.")
+        print(f"Artifacts saved to: {ARTIFACTS_DIR.resolve()}")
+        print(f"Saved model path in JSON: {model_path.as_posix()}")
+        print(f"Model version: {model_version}")
 
 
 if __name__ == "__main__":
