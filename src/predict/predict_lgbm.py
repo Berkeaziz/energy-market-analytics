@@ -71,10 +71,12 @@ def resolve_input_path(mode: str, input_path: str | None) -> Path:
     if mode == "latest":
         return DEFAULT_LATEST_FEATURES_PATH
 
-    if mode in ["backfill_range", "backfill_auto"]:
+    if mode in ["backfill_range", "backfill_auto", "backfill_full"]:
         return DEFAULT_BACKFILL_FEATURES_PATH
 
-    raise ValueError("mode must be one of: latest, backfill_range, backfill_auto")
+    raise ValueError(
+        "mode must be one of: latest, backfill_range, backfill_auto, backfill_full"
+    )
 
 
 def load_inference_features(path: str | Path) -> pd.DataFrame:
@@ -168,9 +170,9 @@ def filter_missing_predictions_for_model(
     model_version: str,
 ) -> pd.DataFrame:
     candidate_df = df.copy()
-    candidate_df["forecast_time"] = pd.to_datetime(candidate_df[DATE_COL], errors="coerce") + pd.Timedelta(
-        hours=TARGET_HORIZON_HOURS
-    )
+    candidate_df["forecast_time"] = pd.to_datetime(
+        candidate_df[DATE_COL], errors="coerce"
+    ) + pd.Timedelta(hours=TARGET_HORIZON_HOURS)
 
     if prediction_store_df.empty:
         filtered_df = candidate_df.drop(columns=["forecast_time"]).reset_index(drop=True)
@@ -218,7 +220,9 @@ def build_prediction_output(
     output = pd.DataFrame()
 
     output["feature_time"] = pd.to_datetime(df[DATE_COL], errors="coerce")
-    output["forecast_time"] = output["feature_time"] + pd.Timedelta(hours=TARGET_HORIZON_HOURS)
+    output["forecast_time"] = output["feature_time"] + pd.Timedelta(
+        hours=TARGET_HORIZON_HOURS
+    )
     output["y_pred"] = preds
     output["prediction_type"] = prediction_type
     output["model_version"] = model_version
@@ -252,9 +256,15 @@ def append_predictions_to_store(
     else:
         combined_df = new_df.copy()
 
-    combined_df["feature_time"] = pd.to_datetime(combined_df["feature_time"], errors="coerce")
-    combined_df["forecast_time"] = pd.to_datetime(combined_df["forecast_time"], errors="coerce")
-    combined_df["created_at"] = pd.to_datetime(combined_df["created_at"], errors="coerce")
+    combined_df["feature_time"] = pd.to_datetime(
+        combined_df["feature_time"], errors="coerce"
+    )
+    combined_df["forecast_time"] = pd.to_datetime(
+        combined_df["forecast_time"], errors="coerce"
+    )
+    combined_df["created_at"] = pd.to_datetime(
+        combined_df["created_at"], errors="coerce"
+    )
 
     combined_df = combined_df.sort_values(
         by=["forecast_time", "created_at"]
@@ -275,13 +285,13 @@ def append_predictions_to_store(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run LightGBM inference for latest, range backfill, or auto backfill."
+        description="Run LightGBM inference for latest, range backfill, auto backfill, or full backfill."
     )
     parser.add_argument(
         "--mode",
         type=str,
         required=True,
-        choices=["latest", "backfill_range", "backfill_auto"],
+        choices=["latest", "backfill_range", "backfill_auto", "backfill_full"],
         help="Inference mode.",
     )
     parser.add_argument(
@@ -353,6 +363,10 @@ def main() -> None:
         )
         prediction_type = "backfill_auto"
         print(f"Using auto-detected missing rows. Shape: {df.shape}")
+
+    elif args.mode == "backfill_full":
+        prediction_type = "backfill_full"
+        print(f"Running FULL backfill. Shape: {df.shape}")
 
     else:
         raise ValueError("Invalid mode.")
