@@ -37,6 +37,29 @@ def validate_required_columns(df: pd.DataFrame) -> None:
         raise ValueError(f"Missing required columns: {missing_cols}")
 
 
+def resolve_duplicate_timestamps(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    For duplicate timestamps, prefer the row with:
+    1. positive ptf over zero/non-positive
+    2. larger ptf
+    """
+    df = df.copy()
+
+    df["_ptf_positive_priority"] = (df["ptf"] > 0).astype("int8")
+    df["_ptf_sort_value"] = df["ptf"].fillna(float("-inf"))
+
+    df = df.sort_values(
+        by=[DATE_COL, "_ptf_positive_priority", "_ptf_sort_value"],
+        ascending=[True, False, False],
+        kind="mergesort",
+    )
+
+    df = df.drop_duplicates(subset=[DATE_COL], keep="first").copy()
+    df = df.drop(columns=["_ptf_positive_priority", "_ptf_sort_value"])
+
+    return df
+
+
 def prepare_base_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
@@ -46,8 +69,11 @@ def prepare_base_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df["priceeur"] = pd.to_numeric(df["priceeur"], errors="coerce")
 
     df = df.dropna(subset=[DATE_COL, "ptf"]).copy()
-    df = df.sort_values(DATE_COL)
-    df = df.drop_duplicates(subset=[DATE_COL], keep="first")
+    df = df.sort_values(DATE_COL, kind="mergesort").copy()
+
+    # Safer dedup for duplicate timestamps
+    df = resolve_duplicate_timestamps(df)
+
     df = df.set_index(DATE_COL)
     df = df.sort_index()
 
@@ -108,9 +134,10 @@ def add_rolling_features(df: pd.DataFrame, windows: list[int]) -> pd.DataFrame:
 def add_diff_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    df["diff_1"] = df["ptf"].diff(1)
-    df["diff_24"] = df["ptf"].diff(24)
-    df["diff_168"] = df["ptf"].diff(168)
+    base = df["ptf"].shift(1)
+    df["diff_1"] = base.diff(1)
+    df["diff_24"] = base.diff(24)
+    df["diff_168"] = base.diff(168)
 
     return df
 
@@ -142,12 +169,14 @@ def add_spike_features(df: pd.DataFrame) -> pd.DataFrame:
     q_low = df["ptf"].quantile(0.01)
     q_high = df["ptf"].quantile(0.99)
 
-    df["spike_high"] = (df["ptf"].shift(1) > q_high).astype("int8")
-    df["spike_low"] = (df["ptf"].shift(1) < q_low).astype("int8")
+    prev_ptf = df["ptf"].shift(1)
 
-    ptf_diff_abs = df["ptf"].diff().abs()
-    rolling_std_24 = df["ptf"].shift(1).rolling(24).std()
-    rolling_std_168 = df["ptf"].shift(1).rolling(168).std()
+    df["spike_high"] = (prev_ptf > q_high).astype("int8")
+    df["spike_low"] = (prev_ptf < q_low).astype("int8")
+
+    ptf_diff_abs = prev_ptf.diff().abs()
+    rolling_std_24 = prev_ptf.rolling(24).std()
+    rolling_std_168 = prev_ptf.rolling(168).std()
 
     df["spike_jump_24"] = (ptf_diff_abs > (3 * rolling_std_24)).astype("int8")
     df["spike_jump_168"] = (ptf_diff_abs > (3 * rolling_std_168)).astype("int8")
