@@ -10,18 +10,14 @@ import pandas as pd
 
 
 ARTIFACTS_DIR = Path("artifacts")
-PREDICTIONS_DIR = ARTIFACTS_DIR / "predictions"
-PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
+MODEL_INFO_PATH = ARTIFACTS_DIR / "modelling_artifact_lgbm" / "model_info.json"
+FEATURE_COLUMNS_PATH = ARTIFACTS_DIR / "modelling_artifact_lgbm" / "feature_columns.json"
 
-MODEL_INFO_PATH = ARTIFACTS_DIR / "modelling_artifact_lgbm" /"model_info.json"
-FEATURE_COLUMNS_PATH = ARTIFACTS_DIR /"modelling_artifact_lgbm" / "feature_columns.json"
+DEFAULT_LATEST_FEATURES_PATH = Path("data/features/ptf/ptf_features_inference_latest.parquet")
+DEFAULT_BACKFILL_FEATURES_PATH = Path("data/features/ptf/ptf_features_inference_backfill.parquet")
 
-DEFAULT_LATEST_FEATURES_PATH = Path(
-    "data/features/ptf/ptf_features_inference_latest.parquet"
-)
-DEFAULT_BACKFILL_FEATURES_PATH = Path(
-    "data/features/ptf/ptf_features_inference_backfill.parquet"
-)
+PREDICTION_STORE_PATH = Path("data/predictions/ptf/ptf_predictions_history.parquet")
+PREDICTION_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 DATE_COL = "date"
 TARGET_HORIZON_HOURS = 24
@@ -36,19 +32,23 @@ def load_json(path: str | Path) -> dict[str, Any]:
         return json.load(f)
 
 
-def load_model(model_info_path: str | Path):
+def load_model_metadata(model_info_path: str | Path) -> tuple[Any, Path, str]:
     model_info = load_json(model_info_path)
 
     model_path_str = model_info.get("model_path")
     if not model_path_str:
         raise KeyError(f"'model_path' not found in {model_info_path}")
 
+    model_version = model_info.get("model_version")
+    if not model_version:
+        raise KeyError(f"'model_version' not found in {model_info_path}")
+
     model_path = Path(model_path_str)
     if not model_path.exists():
         raise FileNotFoundError(f"Model file not found: {model_path}")
 
     model = joblib.load(model_path)
-    return model, model_path
+    return model, model_path, model_version
 
 
 def load_feature_columns(path: str | Path) -> list[str]:
@@ -99,9 +99,7 @@ def load_inference_features(path: str | Path) -> pd.DataFrame:
 def validate_inference_features(df: pd.DataFrame, feature_cols: list[str]) -> None:
     missing_cols = [col for col in feature_cols if col not in df.columns]
     if missing_cols:
-        raise ValueError(
-            f"Missing feature columns in inference dataset: {missing_cols}"
-        )
+        raise ValueError(f"Missing feature columns in inference dataset: {missing_cols}")
 
     null_summary = df[feature_cols].isnull().sum()
     bad_cols = null_summary[null_summary > 0]
@@ -116,15 +114,18 @@ def build_prediction_output(
     df: pd.DataFrame,
     preds,
     mode: str,
+    model_version: str,
+    run_id: str | None,
 ) -> pd.DataFrame:
     output = pd.DataFrame()
 
     output["feature_time"] = pd.to_datetime(df[DATE_COL], errors="coerce")
-    output["forecast_time"] = output["feature_time"] + pd.Timedelta(
-        hours=TARGET_HORIZON_HOURS
-    )
+    output["forecast_time"] = output["feature_time"] + pd.Timedelta(hours=TARGET_HORIZON_HOURS)
     output["y_pred"] = preds
-    output["prediction_mode"] = mode
+    output["prediction_type"] = mode
+    output["model_version"] = model_version
+    output["run_id"] = run_id if run_id else "manual"
+    output["created_at"] = pd.Timestamp.utcnow()
 
     optional_cols = [
         "lag_24",
@@ -140,14 +141,38 @@ def build_prediction_output(
     return output
 
 
-def save_predictions(df: pd.DataFrame, mode: str) -> tuple[Path, Path]:
-    csv_path = PREDICTIONS_DIR / f"ptf_predictions_{mode}.csv"
-    parquet_path = PREDICTIONS_DIR / f"ptf_predictions_{mode}.parquet"
+def append_predictions_to_store(
+    new_df: pd.DataFrame,
+    store_path: str | Path,
+) -> tuple[pd.DataFrame, Path]:
+    store_path = Path(store_path)
+    store_path.parent.mkdir(parents=True, exist_ok=True)
 
-    df.to_csv(csv_path, index=False)
-    df.to_parquet(parquet_path, index=False)
+    if store_path.exists():
+        existing_df = pd.read_parquet(store_path)
+        combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+    else:
+        combined_df = new_df.copy()
 
-    return csv_path, parquet_path
+    combined_df["feature_time"] = pd.to_datetime(combined_df["feature_time"], errors="coerce")
+    combined_df["forecast_time"] = pd.to_datetime(combined_df["forecast_time"], errors="coerce")
+    combined_df["created_at"] = pd.to_datetime(combined_df["created_at"], errors="coerce")
+
+    combined_df = combined_df.sort_values(
+        by=["forecast_time", "created_at"]
+    ).drop_duplicates(
+        subset=["forecast_time", "model_version", "prediction_type"],
+        keep="last",
+    ).reset_index(drop=True)
+
+    combined_df.to_parquet(
+        store_path,
+        engine="pyarrow",
+        compression="snappy",
+        index=False,
+    )
+
+    return combined_df, store_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -167,6 +192,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional custom inference parquet path.",
     )
+    parser.add_argument(
+        "--run-id",
+        type=str,
+        default=None,
+        help="Optional pipeline run identifier.",
+    )
     return parser.parse_args()
 
 
@@ -174,8 +205,9 @@ def main() -> None:
     args = parse_args()
 
     print("Loading model...")
-    model, model_path = load_model(MODEL_INFO_PATH)
+    model, model_path, model_version = load_model_metadata(MODEL_INFO_PATH)
     print(f"Loaded model from: {model_path}")
+    print(f"Model version: {model_version}")
 
     print("Loading feature columns...")
     feature_cols = load_feature_columns(FEATURE_COLUMNS_PATH)
@@ -199,19 +231,26 @@ def main() -> None:
         df=df,
         preds=preds,
         mode=args.mode,
+        model_version=model_version,
+        run_id=args.run_id,
     )
 
-    csv_path, parquet_path = save_predictions(prediction_df, mode=args.mode)
+    combined_df, store_path = append_predictions_to_store(
+        new_df=prediction_df,
+        store_path=PREDICTION_STORE_PATH,
+    )
 
     print("Prediction sample:")
     print(prediction_df.head())
 
     print("Done.")
-    print(f"Prediction rows : {len(prediction_df)}")
-    print(f"Feature time min: {prediction_df['feature_time'].min()}")
-    print(f"Feature time max: {prediction_df['feature_time'].max()}")
-    print(f"Saved CSV       : {csv_path}")
-    print(f"Saved Parquet   : {parquet_path}")
+    print(f"New prediction rows : {len(prediction_df)}")
+    print(f"Store total rows    : {len(combined_df)}")
+    print(f"Feature time min    : {prediction_df['feature_time'].min()}")
+    print(f"Feature time max    : {prediction_df['feature_time'].max()}")
+    print(f"Prediction store    : {store_path}")
+    print(f"Model version       : {model_version}")
+    print(f"Run ID              : {args.run_id if args.run_id else 'manual'}")
 
 
 if __name__ == "__main__":
