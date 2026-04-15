@@ -24,6 +24,8 @@ ACTUAL_COL = "ptf"
 FORECAST_COL = "forecast_time"
 PRED_COL = "y_pred"
 
+MIN_ABS_TARGET_FOR_MAPE = 1e-6
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -86,29 +88,43 @@ def save_json(data: dict[str, Any], path: str | Path) -> None:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
+def to_naive_datetime(series: pd.Series) -> pd.Series:
+    series = pd.to_datetime(series, errors="coerce")
+
+    if pd.api.types.is_datetime64tz_dtype(series):
+        series = series.dt.tz_convert("UTC").dt.tz_localize(None)
+
+    return series
+
+
 def evaluate_regression(
     y_true: np.ndarray | pd.Series,
     y_pred: np.ndarray | pd.Series,
     prefix: str = "",
 ) -> dict[str, float | None]:
-    y_true = np.asarray(y_true)
-    y_pred = np.asarray(y_pred)
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+
+    valid_mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    y_true = y_true[valid_mask]
+    y_pred = y_pred[valid_mask]
+
+    if len(y_true) == 0:
+        return {
+            f"{prefix}mae": None,
+            f"{prefix}rmse": None,
+            f"{prefix}mape": None,
+        }
 
     mae = mean_absolute_error(y_true, y_pred)
     rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
-    nonzero_mask = y_true != 0
-    if nonzero_mask.sum() == 0:
+    mape_mask = np.abs(y_true) > MIN_ABS_TARGET_FOR_MAPE
+    if mape_mask.sum() == 0:
         mape = None
     else:
         mape = float(
-            np.mean(
-                np.abs(
-                    (y_true[nonzero_mask] - y_pred[nonzero_mask])
-                    / y_true[nonzero_mask]
-                )
-            )
-            * 100
+            np.mean(np.abs((y_true[mape_mask] - y_pred[mape_mask]) / y_true[mape_mask])) * 100
         )
 
     return {
@@ -136,16 +152,14 @@ def load_prediction_history(path: str | Path) -> pd.DataFrame:
     ]
     missing_cols = [col for col in required_cols if col not in df.columns]
     if missing_cols:
-        raise ValueError(
-            f"Prediction history is missing required columns: {missing_cols}"
-        )
+        raise ValueError(f"Prediction history is missing required columns: {missing_cols}")
 
     for col in ["feature_time", "forecast_time", "created_at"]:
-        df[col] = pd.to_datetime(df[col], errors="coerce")
+        df[col] = to_naive_datetime(df[col])
 
     df["y_pred"] = pd.to_numeric(df["y_pred"], errors="coerce")
 
-    df = df.dropna(subset=["forecast_time", "y_pred"]).copy()
+    df = df.dropna(subset=["forecast_time", "y_pred", "created_at"]).copy()
     df = df.sort_values(["forecast_time", "created_at"]).reset_index(drop=True)
 
     if df.empty:
@@ -174,7 +188,7 @@ def load_actuals(path: str | Path) -> pd.DataFrame:
     if ACTUAL_COL not in df.columns:
         raise ValueError(f"'{ACTUAL_COL}' column not found in actuals dataset.")
 
-    df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
+    df[DATE_COL] = to_naive_datetime(df[DATE_COL])
     df[ACTUAL_COL] = pd.to_numeric(df[ACTUAL_COL], errors="coerce")
 
     df = df.dropna(subset=[DATE_COL, ACTUAL_COL]).copy()
@@ -241,13 +255,13 @@ def build_evaluation_dataframe(
     eval_df["abs_error"] = eval_df["error"].abs()
     eval_df["squared_error"] = eval_df["error"] ** 2
 
-    eval_df["ape"] = np.where(
-        eval_df["y_true"].notna() & (eval_df["y_true"] != 0),
-        (eval_df["abs_error"] / eval_df["y_true"].abs()) * 100,
-        np.nan,
-    )
+    ape_mask = eval_df["y_true"].notna() & (eval_df["y_true"].abs() > MIN_ABS_TARGET_FOR_MAPE)
+    eval_df["ape"] = np.nan
+    eval_df.loc[ape_mask, "ape"] = (
+        eval_df.loc[ape_mask, "abs_error"] / eval_df.loc[ape_mask, "y_true"].abs()
+    ) * 100
 
-    eval_df["evaluation_created_at"] = pd.Timestamp.utcnow()
+    eval_df["evaluation_created_at"] = pd.Timestamp.utcnow().tz_localize(None)
 
     preferred_cols = [
         "feature_time",
@@ -275,6 +289,36 @@ def build_evaluation_dataframe(
     return eval_df
 
 
+def build_group_metrics(
+    df: pd.DataFrame,
+    group_cols: list[str],
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+
+    for group_keys, group in df.groupby(group_cols, dropna=False):
+        if not isinstance(group_keys, tuple):
+            group_keys = (group_keys,)
+
+        group_result = {
+            col: value for col, value in zip(group_cols, group_keys)
+        }
+        group_result["rows"] = int(len(group))
+
+        metrics = evaluate_regression(
+            y_true=group["y_true"].values,
+            y_pred=group["y_pred"].values,
+        )
+        group_result.update(metrics)
+        results.append(group_result)
+
+    sort_cols = group_cols.copy()
+    results = sorted(
+        results,
+        key=lambda x: tuple("" if x.get(col) is None else str(x.get(col)) for col in sort_cols),
+    )
+    return results
+
+
 def build_summary(eval_df: pd.DataFrame) -> dict[str, Any]:
     available_df = eval_df[eval_df["actual_available"]].copy()
 
@@ -282,12 +326,8 @@ def build_summary(eval_df: pd.DataFrame) -> dict[str, Any]:
         "total_prediction_rows": int(len(eval_df)),
         "rows_with_actual": int(len(available_df)),
         "rows_without_actual": int((~eval_df["actual_available"]).sum()),
-        "forecast_time_min": (
-            str(eval_df["forecast_time"].min()) if not eval_df.empty else None
-        ),
-        "forecast_time_max": (
-            str(eval_df["forecast_time"].max()) if not eval_df.empty else None
-        ),
+        "forecast_time_min": str(eval_df["forecast_time"].min()) if not eval_df.empty else None,
+        "forecast_time_max": str(eval_df["forecast_time"].max()) if not eval_df.empty else None,
         "evaluated_forecast_time_min": (
             str(available_df["forecast_time"].min()) if not available_df.empty else None
         ),
@@ -304,53 +344,26 @@ def build_summary(eval_df: pd.DataFrame) -> dict[str, Any]:
         }
         summary["by_prediction_type"] = []
         summary["by_model_version"] = []
+        summary["by_model_version_and_prediction_type"] = []
         return summary
 
-    overall_metrics = evaluate_regression(
+    summary["overall_metrics"] = evaluate_regression(
         y_true=available_df["y_true"].values,
         y_pred=available_df["y_pred"].values,
     )
-    summary["overall_metrics"] = overall_metrics
 
-    by_prediction_type = []
-    for pred_type, group in available_df.groupby("prediction_type", dropna=False):
-        metrics = evaluate_regression(group["y_true"].values, group["y_pred"].values)
-        by_prediction_type.append(
-            {
-                "prediction_type": pred_type,
-                "rows": int(len(group)),
-                **metrics,
-            }
-        )
-    summary["by_prediction_type"] = by_prediction_type
-
-    by_model_version = []
-    for model_version, group in available_df.groupby("model_version", dropna=False):
-        metrics = evaluate_regression(group["y_true"].values, group["y_pred"].values)
-        by_model_version.append(
-            {
-                "model_version": model_version,
-                "rows": int(len(group)),
-                **metrics,
-            }
-        )
-    summary["by_model_version"] = by_model_version
-
-    by_model_and_type = []
-    for (model_version, pred_type), group in available_df.groupby(
-        ["model_version", "prediction_type"],
-        dropna=False,
-    ):
-        metrics = evaluate_regression(group["y_true"].values, group["y_pred"].values)
-        by_model_and_type.append(
-            {
-                "model_version": model_version,
-                "prediction_type": pred_type,
-                "rows": int(len(group)),
-                **metrics,
-            }
-        )
-    summary["by_model_version_and_prediction_type"] = by_model_and_type
+    summary["by_prediction_type"] = build_group_metrics(
+        available_df,
+        group_cols=["prediction_type"],
+    )
+    summary["by_model_version"] = build_group_metrics(
+        available_df,
+        group_cols=["model_version"],
+    )
+    summary["by_model_version_and_prediction_type"] = build_group_metrics(
+        available_df,
+        group_cols=["model_version", "prediction_type"],
+    )
 
     return summary
 
