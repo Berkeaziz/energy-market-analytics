@@ -7,7 +7,8 @@ import numpy as np
 import pandas as pd
 
 
-PROCESSED_PATH = Path("data/processed/ptf/ptf_processed.parquet")
+PROCESSED_PTF_PATH = Path("data/processed/ptf/ptf_processed.parquet")
+PROCESSED_WEATHER_PATH = Path("data/processed/weather/weather_processed.parquet")
 
 TRAIN_FEATURES_PATH = Path("data/features/ptf/ptf_features.parquet")
 INFERENCE_LATEST_PATH = Path("data/features/ptf/ptf_features_inference_latest.parquet")
@@ -17,6 +18,7 @@ TARGET_HORIZON = 24
 
 LAGS = [1, 3, 24, 48, 72, 168, 336]
 ROLLING_WINDOWS = [24, 168]
+WEATHER_LAGS = [1, 24, 168]
 
 DATE_COL = "date"
 TARGET_COL = "target"
@@ -38,11 +40,6 @@ def validate_required_columns(df: pd.DataFrame) -> None:
 
 
 def resolve_duplicate_timestamps(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    For duplicate timestamps, prefer the row with:
-    1. positive ptf over zero/non-positive
-    2. larger ptf
-    """
     df = df.copy()
 
     df["_ptf_positive_priority"] = (df["ptf"] > 0).astype("int8")
@@ -64,6 +61,10 @@ def prepare_base_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
+
+    if pd.api.types.is_datetime64tz_dtype(df[DATE_COL]):
+        df[DATE_COL] = df[DATE_COL].dt.tz_localize(None)
+
     df["ptf"] = pd.to_numeric(df["ptf"], errors="coerce")
     df["priceusd"] = pd.to_numeric(df["priceusd"], errors="coerce")
     df["priceeur"] = pd.to_numeric(df["priceeur"], errors="coerce")
@@ -71,12 +72,95 @@ def prepare_base_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=[DATE_COL, "ptf"]).copy()
     df = df.sort_values(DATE_COL, kind="mergesort").copy()
 
-    # Safer dedup for duplicate timestamps
     df = resolve_duplicate_timestamps(df)
 
     df = df.set_index(DATE_COL)
     df = df.sort_index()
 
+    return df
+
+
+def load_weather_data(path: str | Path) -> pd.DataFrame:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Processed weather parquet not found: {path}")
+
+    df = pd.read_parquet(path).copy()
+
+    if DATE_COL not in df.columns:
+        raise ValueError(f"Weather dataset must include '{DATE_COL}' column.")
+
+    df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
+
+    if pd.api.types.is_datetime64tz_dtype(df[DATE_COL]):
+        df[DATE_COL] = df[DATE_COL].dt.tz_localize(None)
+
+    df = df.dropna(subset=[DATE_COL]).copy()
+    df = df.sort_values(DATE_COL, kind="mergesort")
+    df = df.drop_duplicates(subset=[DATE_COL], keep="last").copy()
+
+    helper_drop_cols = [
+        col for col in df.columns
+        if col != DATE_COL and (
+            col.startswith("_chunk")
+            or col.startswith("_source")
+            or col.startswith("_meta")
+            or col.lower().startswith("unnamed")
+        )
+    ]
+    if helper_drop_cols:
+        df = df.drop(columns=helper_drop_cols)
+
+    weather_cols = [col for col in df.columns if col != DATE_COL]
+    rename_map = {}
+
+    for col in weather_cols:
+        if not col.startswith("weather_"):
+            rename_map[col] = f"weather_{col}"
+
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    calendar_tokens = [
+        "year",
+        "month",
+        "day",
+        "hour",
+        "weekday",
+        "week",
+        "quarter",
+    ]
+
+    bad_weather_cols = []
+    for col in df.columns:
+        if col == DATE_COL:
+            continue
+
+        col_lower = col.lower()
+
+        if any(token in col_lower for token in calendar_tokens):
+            bad_weather_cols.append(col)
+            continue
+
+        if df[col].nunique(dropna=True) <= 1:
+            bad_weather_cols.append(col)
+
+    if bad_weather_cols:
+        df = df.drop(columns=sorted(set(bad_weather_cols)))
+
+    return df
+
+
+def merge_external_features(
+    df: pd.DataFrame,
+    weather_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    df = df.copy().reset_index()
+
+    if weather_df is not None:
+        df = df.merge(weather_df, on=DATE_COL, how="left")
+
+    df = df.sort_values(DATE_COL, kind="mergesort").set_index(DATE_COL)
     return df
 
 
@@ -184,14 +268,65 @@ def add_spike_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def get_weather_feature_columns(df: pd.DataFrame) -> list[str]:
+    base_weather_cols = []
+
+    engineered_tokens = [
+        "_lag_",
+        "_rolling_mean_",
+        "_rolling_std_",
+        "_rolling_min_",
+        "_rolling_max_",
+    ]
+
+    banned_tokens = [
+        "year",
+        "month",
+        "day",
+        "hour",
+        "weekday",
+        "week",
+        "quarter",
+    ]
+
+    for col in df.columns:
+        if not col.startswith("weather_"):
+            continue
+
+        if any(token in col for token in engineered_tokens):
+            continue
+
+        if any(token in col.lower() for token in banned_tokens):
+            continue
+
+        base_weather_cols.append(col)
+
+    return sorted(base_weather_cols)
+
+
+def add_weather_features(df: pd.DataFrame, weather_cols: list[str]) -> pd.DataFrame:
+    df = df.copy()
+
+    for col in weather_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        for lag in WEATHER_LAGS:
+            df[f"{col}_lag_{lag}"] = df[col].shift(lag)
+
+        df[f"{col}_rolling_mean_24"] = df[col].shift(1).rolling(24).mean()
+        df[f"{col}_rolling_mean_168"] = df[col].shift(1).rolling(168).mean()
+
+    return df
+
+
 def add_target(df: pd.DataFrame, horizon: int = TARGET_HORIZON) -> pd.DataFrame:
     df = df.copy()
     df[TARGET_COL] = df["ptf"].shift(-horizon)
     return df
 
 
-def build_feature_list() -> list[str]:
-    return [
+def build_feature_list(df: pd.DataFrame) -> list[str]:
+    base_features = [
         "hour",
         "day_of_week",
         "is_weekend",
@@ -230,6 +365,18 @@ def build_feature_list() -> list[str]:
         "spike_jump_24",
         "spike_jump_168",
     ]
+
+    weather_cols = get_weather_feature_columns(df)
+    weather_engineered_cols = []
+
+    for col in weather_cols:
+        weather_engineered_cols.append(col)
+        for lag in WEATHER_LAGS:
+            weather_engineered_cols.append(f"{col}_lag_{lag}")
+        weather_engineered_cols.append(f"{col}_rolling_mean_24")
+        weather_engineered_cols.append(f"{col}_rolling_mean_168")
+
+    return base_features + weather_engineered_cols
 
 
 def validate_engineered_features(df: pd.DataFrame, feature_cols: list[str]) -> None:
@@ -294,15 +441,27 @@ def save_features(df: pd.DataFrame, path: str | Path) -> None:
     )
 
 
-def run_feature_pipeline(mode: str) -> None:
-    print("Loading processed data...")
-    df = load_processed_data(PROCESSED_PATH)
+def run_feature_pipeline(mode: str, use_weather: bool = True) -> None:
+    print("Loading processed PTF data...")
+    df = load_processed_data(PROCESSED_PTF_PATH)
 
-    print("Validating required columns...")
+    print("Validating required PTF columns...")
     validate_required_columns(df)
 
     print("Preparing base dataframe...")
     df = prepare_base_dataframe(df)
+
+    if use_weather:
+        print("Loading processed weather data...")
+        weather_df = load_weather_data(PROCESSED_WEATHER_PATH)
+
+        print(f"Weather dataframe shape after cleaning: {weather_df.shape}")
+        print("Weather columns after cleaning:")
+        for col in weather_df.columns:
+            print(f" - {col}")
+
+        print("Merging weather data...")
+        df = merge_external_features(df, weather_df=weather_df)
 
     print("Adding time features...")
     df = add_time_features(df)
@@ -325,7 +484,15 @@ def run_feature_pipeline(mode: str) -> None:
     print("Adding spike features...")
     df = add_spike_features(df)
 
-    feature_cols = build_feature_list()
+    if use_weather:
+        weather_cols = get_weather_feature_columns(df)
+        print("Detected weather base columns:")
+        for col in weather_cols:
+            print(f" - {col}")
+        print(f"Adding weather features... found {len(weather_cols)} weather base columns")
+        df = add_weather_features(df, weather_cols=weather_cols)
+
+    feature_cols = build_feature_list(df)
     validate_engineered_features(df, feature_cols)
 
     if mode == "train":
@@ -347,15 +514,14 @@ def run_feature_pipeline(mode: str) -> None:
         output_path = INFERENCE_BACKFILL_PATH
 
     else:
-        raise ValueError(
-            "mode must be one of: train, inference_latest, inference_backfill"
-        )
+        raise ValueError("mode must be one of: train, inference_latest, inference_backfill")
 
     print("Saving feature dataset...")
     save_features(df_final, output_path)
 
     print("Done.")
     print(f"Mode       : {mode}")
+    print(f"Use weather: {use_weather}")
     print(f"Final shape: {df_final.shape}")
     print(f"Saved to   : {output_path}")
 
@@ -378,12 +544,20 @@ def parse_args() -> argparse.Namespace:
         choices=["train", "inference_latest", "inference_backfill"],
         help="Feature generation mode.",
     )
+    parser.add_argument(
+        "--no-weather",
+        action="store_true",
+        help="Disable weather feature merge.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    run_feature_pipeline(mode=args.mode)
+    run_feature_pipeline(
+        mode=args.mode,
+        use_weather=not args.no_weather,
+    )
 
 
 if __name__ == "__main__":
