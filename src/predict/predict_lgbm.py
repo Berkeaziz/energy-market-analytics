@@ -7,6 +7,7 @@ from typing import Any
 
 import joblib
 import pandas as pd
+from pandas.api.types import DatetimeTZDtype
 
 
 ARTIFACTS_DIR = Path("artifacts")
@@ -21,6 +22,33 @@ PREDICTION_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 DATE_COL = "date"
 TARGET_HORIZON_HOURS = 24
+
+BASE_PREDICTION_COLUMNS = [
+    "feature_time",
+    "forecast_time",
+    "y_pred",
+    "prediction_type",
+    "model_version",
+    "run_id",
+    "created_at",
+]
+
+OPTIONAL_OUTPUT_COLUMNS = [
+    "lag_24",
+    "lag_168",
+    "hour",
+    "day_of_week",
+    "is_weekend",
+]
+
+
+def to_naive_datetime(series: pd.Series) -> pd.Series:
+    series = pd.to_datetime(series, errors="coerce")
+
+    if isinstance(series.dtype, DatetimeTZDtype):
+        series = series.dt.tz_localize(None)
+
+    return series
 
 
 def load_json(path: str | Path) -> dict[str, Any]:
@@ -89,7 +117,8 @@ def load_inference_features(path: str | Path) -> pd.DataFrame:
     if DATE_COL not in df.columns:
         raise ValueError(f"'{DATE_COL}' column not found in inference dataset.")
 
-    df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+    df[DATE_COL] = to_naive_datetime(df[DATE_COL])
     df = df.dropna(subset=[DATE_COL]).copy()
     df = df.sort_values(DATE_COL).reset_index(drop=True)
 
@@ -136,32 +165,44 @@ def apply_date_range_filter(
     return filtered_df
 
 
+def normalize_prediction_store_schema(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+
+    for col in BASE_PREDICTION_COLUMNS + OPTIONAL_OUTPUT_COLUMNS:
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    keep_cols = BASE_PREDICTION_COLUMNS + OPTIONAL_OUTPUT_COLUMNS
+    df = df[keep_cols].copy()
+
+    for col in ["feature_time", "forecast_time", "created_at"]:
+        df[col] = to_naive_datetime(df[col])
+
+    if "y_pred" in df.columns:
+        df["y_pred"] = pd.to_numeric(df["y_pred"], errors="coerce")
+
+    text_cols = ["prediction_type", "model_version", "run_id"]
+    for col in text_cols:
+        if col in df.columns:
+            df[col] = df[col].astype("string")
+
+    for col in ["lag_24", "lag_168", "hour", "day_of_week", "is_weekend"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df
+
+
 def load_prediction_store(store_path: str | Path) -> pd.DataFrame:
     store_path = Path(store_path)
 
     if not store_path.exists():
-        return pd.DataFrame(
-            columns=[
-                "feature_time",
-                "forecast_time",
-                "y_pred",
-                "prediction_type",
-                "model_version",
-                "run_id",
-                "created_at",
-            ]
-        )
+        return normalize_prediction_store_schema(pd.DataFrame(columns=BASE_PREDICTION_COLUMNS))
 
     df = pd.read_parquet(store_path)
-
-    if "feature_time" in df.columns:
-        df["feature_time"] = pd.to_datetime(df["feature_time"], errors="coerce")
-    if "forecast_time" in df.columns:
-        df["forecast_time"] = pd.to_datetime(df["forecast_time"], errors="coerce")
-    if "created_at" in df.columns:
-        df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
-
-    return df
+    return normalize_prediction_store_schema(df)
 
 
 def filter_missing_predictions_for_model(
@@ -170,9 +211,9 @@ def filter_missing_predictions_for_model(
     model_version: str,
 ) -> pd.DataFrame:
     candidate_df = df.copy()
-    candidate_df["forecast_time"] = pd.to_datetime(
-        candidate_df[DATE_COL], errors="coerce"
-    ) + pd.Timedelta(hours=TARGET_HORIZON_HOURS)
+    candidate_df["forecast_time"] = (
+        to_naive_datetime(candidate_df[DATE_COL]) + pd.Timedelta(hours=TARGET_HORIZON_HOURS)
+    )
 
     if prediction_store_df.empty:
         return candidate_df.drop(columns=["forecast_time"]).reset_index(drop=True)
@@ -207,7 +248,7 @@ def build_prediction_output(
 ) -> pd.DataFrame:
     output = pd.DataFrame()
 
-    output["feature_time"] = pd.to_datetime(df[DATE_COL], errors="coerce")
+    output["feature_time"] = to_naive_datetime(df[DATE_COL])
     output["forecast_time"] = output["feature_time"] + pd.Timedelta(
         hours=TARGET_HORIZON_HOURS
     )
@@ -215,20 +256,13 @@ def build_prediction_output(
     output["prediction_type"] = prediction_type
     output["model_version"] = model_version
     output["run_id"] = run_id if run_id else "manual"
-    output["created_at"] = pd.Timestamp.utcnow()
+    output["created_at"] = pd.Timestamp.now().floor("s")
 
-    optional_cols = [
-        "lag_24",
-        "lag_168",
-        "hour",
-        "day_of_week",
-        "is_weekend",
-    ]
-    for col in optional_cols:
+    for col in OPTIONAL_OUTPUT_COLUMNS:
         if col in df.columns:
             output[col] = df[col].values
 
-    return output
+    return normalize_prediction_store_schema(output)
 
 
 def append_predictions_to_store(
@@ -238,20 +272,23 @@ def append_predictions_to_store(
     store_path = Path(store_path)
     store_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if store_path.exists():
-        existing_df = pd.read_parquet(store_path)
-        combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-    else:
-        combined_df = new_df.copy()
+    existing_df = load_prediction_store(store_path)
+    new_df = normalize_prediction_store_schema(new_df)
 
-    combined_df["feature_time"] = pd.to_datetime(
-        combined_df["feature_time"], errors="coerce"
-    )
-    combined_df["forecast_time"] = pd.to_datetime(
-        combined_df["forecast_time"], errors="coerce"
-    )
-    combined_df["created_at"] = pd.to_datetime(
-        combined_df["created_at"], errors="coerce"
+    all_cols = BASE_PREDICTION_COLUMNS + OPTIONAL_OUTPUT_COLUMNS
+
+    existing_df = existing_df.reindex(columns=all_cols)
+    new_df = new_df.reindex(columns=all_cols)
+
+    if existing_df.empty:
+        combined_df = new_df.copy()
+    else:
+        combined_df = pd.concat([existing_df, new_df], ignore_index=True, sort=False)
+
+    combined_df = normalize_prediction_store_schema(combined_df)
+
+    combined_df = combined_df.dropna(
+        subset=["feature_time", "forecast_time", "y_pred", "model_version", "prediction_type"]
     )
 
     combined_df = combined_df.sort_values(
@@ -269,7 +306,6 @@ def append_predictions_to_store(
     )
 
     return combined_df, store_path
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
