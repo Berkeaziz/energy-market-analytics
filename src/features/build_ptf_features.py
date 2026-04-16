@@ -31,6 +31,14 @@ EXTERNAL_ROLLING_WINDOWS = [24, 168]
 DATE_COL = "date"
 TARGET_COL = "target"
 
+EPSILON = 1e-6
+
+JUMP_FLAG_COLS = [
+    "smf_smf",
+    "gen_naturalGas",
+    "gen_wind",
+    "gen_sun",
+]
 
 def load_processed_data(path: str | Path) -> pd.DataFrame:
     path = Path(path)
@@ -532,6 +540,64 @@ def get_weather_feature_columns(df: pd.DataFrame) -> list[str]:
 
     return sorted(base_weather_cols)
 
+def add_ptf_regime_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    prev_ptf = df["ptf"].shift(1)
+
+    rolling_mean_24 = prev_ptf.rolling(24).mean()
+    rolling_mean_168 = prev_ptf.rolling(168).mean()
+    rolling_std_24 = prev_ptf.rolling(24).std()
+
+    df["ptf_ratio_24"] = prev_ptf / (prev_ptf.shift(24) + EPSILON)
+    df["ptf_ratio_168"] = prev_ptf / (prev_ptf.shift(168) + EPSILON)
+
+    df["ptf_above_mean_24"] = (prev_ptf > rolling_mean_24).astype("int8")
+    df["ptf_above_mean_168"] = (prev_ptf > rolling_mean_168).astype("int8")
+
+    df["ptf_zscore_24"] = (prev_ptf - rolling_mean_24) / (rolling_std_24 + EPSILON)
+
+    return df
+
+
+def add_selected_external_regime_features(
+    df: pd.DataFrame,
+    jump_cols: list[str] | None = None,
+) -> pd.DataFrame:
+    df = df.copy()
+
+    if "smf_smf" in df.columns:
+        smf_base = df["smf_smf"].shift(1)
+
+        smf_mean_24 = smf_base.rolling(24).mean()
+        smf_mean_168 = smf_base.rolling(168).mean()
+
+        df["smf_diff_1"] = smf_base.diff(1)
+        df["smf_diff_24"] = smf_base.diff(24)
+        df["smf_diff_168"] = smf_base.diff(168)
+
+        df["smf_ratio_24"] = smf_base / (smf_base.shift(24) + EPSILON)
+        df["smf_ratio_168"] = smf_base / (smf_base.shift(168) + EPSILON)
+
+        df["smf_above_mean_24"] = (smf_base > smf_mean_24).astype("int8")
+        df["smf_above_mean_168"] = (smf_base > smf_mean_168).astype("int8")
+
+    if jump_cols is None:
+        jump_cols = []
+
+    for col in jump_cols:
+        if col not in df.columns:
+            continue
+
+        base = df[col].shift(1)
+        rolling_std_24 = base.rolling(24).std()
+        rolling_std_168 = base.rolling(168).std()
+        jump_abs = base.diff().abs()
+
+        df[f"{col}_jump_24"] = (jump_abs > (2.5 * rolling_std_24)).astype("int8")
+        df[f"{col}_jump_168"] = (jump_abs > (2.5 * rolling_std_168)).astype("int8")
+
+    return df
 
 def add_weather_features(df: pd.DataFrame, weather_cols: list[str]) -> pd.DataFrame:
     df = df.copy()
