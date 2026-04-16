@@ -616,19 +616,31 @@ def add_weather_features(df: pd.DataFrame, weather_cols: list[str]) -> pd.DataFr
 
 def get_external_feature_columns(df: pd.DataFrame) -> list[str]:
     prefixes = ("gen_", "cons_", "smf_")
+
     engineered_tokens = (
         "_lag_",
         "_rolling_mean_",
         "_rolling_std_",
         "_rolling_min_",
         "_rolling_max_",
+        "_jump_",
+        "_diff_",
+        "_ratio_",
+        "_zscore_",
     )
+
+    engineered_exact_cols = {
+        "smf_above_mean_24",
+        "smf_above_mean_168",
+    }
 
     base_cols = []
     for col in df.columns:
         if not col.startswith(prefixes):
             continue
         if any(token in col for token in engineered_tokens):
+            continue
+        if col in engineered_exact_cols:
             continue
         base_cols.append(col)
 
@@ -697,6 +709,18 @@ def build_feature_list(df: pd.DataFrame) -> list[str]:
         "spike_low",
         "spike_jump_24",
         "spike_jump_168",
+        "ptf_ratio_24",
+        "ptf_ratio_168",
+        "ptf_above_mean_24",
+        "ptf_above_mean_168",
+        "ptf_zscore_24",
+        "smf_diff_1",
+        "smf_diff_24",
+        "smf_diff_168",
+        "smf_ratio_24",
+        "smf_ratio_168",
+        "smf_above_mean_24",
+        "smf_above_mean_168",
     ]
 
     weather_cols = get_weather_feature_columns(df)
@@ -719,6 +743,10 @@ def build_feature_list(df: pd.DataFrame) -> list[str]:
         for window in EXTERNAL_ROLLING_WINDOWS:
             external_engineered_cols.append(f"{col}_rolling_mean_{window}")
             external_engineered_cols.append(f"{col}_rolling_std_{window}")
+
+        if col in JUMP_FLAG_COLS:
+            external_engineered_cols.append(f"{col}_jump_24")
+            external_engineered_cols.append(f"{col}_jump_168")
 
     return base_features + weather_engineered_cols + external_engineered_cols
 
@@ -866,6 +894,9 @@ def run_feature_pipeline(
 
     print("Adding spike features...")
     df = add_spike_features(df, q_low=q_low, q_high=q_high)
+
+    print("Adding PTF regime features...")
+    df = add_ptf_regime_features(df)
     if use_weather:
         weather_cols = get_weather_feature_columns(df)
         print(f"Adding weather features... found {len(weather_cols)} weather base columns")
@@ -875,6 +906,12 @@ def run_feature_pipeline(
         external_cols = get_external_feature_columns(df)
         print(f"Adding generation/consumption/SMF features... found {len(external_cols)} external base columns")
         df = add_external_side_features(df, external_cols=external_cols)
+
+        print("Adding selected external regime/jump features...")
+        df = add_selected_external_regime_features(
+            df,
+            jump_cols=JUMP_FLAG_COLS,
+        )
 
     feature_cols = build_feature_list(df)
     validate_engineered_features(df, feature_cols)
