@@ -28,6 +28,7 @@ DROP_COLS = [
 ]
 
 BEST_PARAMS_PATH = Path("artifacts/modelling_artifact/ptf_best_params_optuna.json")
+BEST_FEATURES_PATH = Path("artifacts/modelling_artifact/ptf_feature_columns.json")
 
 TRAIN_RATIO = 0.70
 VAL_RATIO = 0.15
@@ -43,6 +44,20 @@ def load_best_params(path: str | Path) -> dict[str, Any]:
 
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def load_best_features(path: str | Path) -> list[str]:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Best features file not found: {path}")
+
+    with open(path, "r", encoding="utf-8") as f:
+        best_features = json.load(f)
+
+    if not isinstance(best_features, list) or not best_features:
+        raise ValueError("Best features file must contain a non-empty JSON list.")
+
+    return best_features
 
 
 def load_features(path: str | Path) -> pd.DataFrame:
@@ -67,6 +82,12 @@ def validate_dataset(df: pd.DataFrame) -> None:
 
     if missing_cols:
         raise ValueError(f"Missing required columns: {missing_cols}")
+
+
+def validate_feature_columns(df: pd.DataFrame, feature_cols: list[str]) -> None:
+    missing_feature_cols = [col for col in feature_cols if col not in df.columns]
+    if missing_feature_cols:
+        raise ValueError(f"Missing selected feature columns in dataset: {missing_feature_cols}")
 
 
 def chronological_split(
@@ -155,11 +176,18 @@ def main() -> None:
     df = df.dropna(subset=[TARGET_COL, BASELINE_COL]).copy()
     print(f"Dataset shape after target/baseline cleaning: {df.shape}")
 
-    feature_cols = get_feature_columns(df, DROP_COLS)
+    print("\nLoading best features (TOP 30)...")
+    feature_cols = load_best_features(BEST_FEATURES_PATH)
+    validate_feature_columns(df, feature_cols)
 
-    print(f"Total feature count: {len(feature_cols)}")
-    print("First 15 features:")
-    print(feature_cols[:15])
+    print(f"Selected feature count: {len(feature_cols)}")
+    print("Selected features:")
+    print(feature_cols)
+
+    all_available_features = get_feature_columns(df, DROP_COLS)
+    print(f"\nTotal available feature count in dataset: {len(all_available_features)}")
+    print("First 15 available features:")
+    print(all_available_features[:15])
 
     train_df, val_df, test_df = chronological_split(df)
     train_val_df = pd.concat([train_df, val_df], axis=0).copy()
@@ -170,14 +198,14 @@ def main() -> None:
     X_test = test_df[feature_cols].copy()
     y_test = test_df[TARGET_COL].copy()
 
-    print("Split shapes:")
+    print("\nSplit shapes:")
     print(f"Train     : {train_df.shape}")
     print(f"Validation: {val_df.shape}")
     print(f"Train+Val : {X_train_val.shape}, {y_train_val.shape}")
     print(f"Test      : {X_test.shape}, {y_test.shape}")
 
     print("\nRunning baseline evaluation on test set...")
-    test_baseline_pred = X_test[BASELINE_COL].values
+    test_baseline_pred = test_df[BASELINE_COL].values
 
     baseline_test_metrics = evaluate_regression(
         y_test,
@@ -204,9 +232,9 @@ def main() -> None:
     print("\nConfiguring MLflow...")
     mlflow.set_experiment(EXPERIMENT_NAME)
 
-    model_version = f"lgbm_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    model_version = f"lgbm_top30_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
-    with mlflow.start_run(run_name="lightgbm_final_train_val"):
+    with mlflow.start_run(run_name="lightgbm_final_train_val_top30"):
         mlflow.set_tag("model_version", model_version)
 
         mlflow.log_param("model_type", "LGBMRegressor")
@@ -217,6 +245,7 @@ def main() -> None:
         mlflow.log_param("val_ratio", VAL_RATIO)
         mlflow.log_param("test_ratio", TEST_RATIO)
         mlflow.log_param("model_version", model_version)
+        mlflow.log_param("feature_source", BEST_FEATURES_PATH.as_posix())
 
         mlflow.log_params(best_params)
 
@@ -230,7 +259,7 @@ def main() -> None:
         if baseline_metrics["test_mape"] is not None:
             mlflow.log_metric("baseline_test_mape", baseline_metrics["test_mape"])
 
-        print("\nTraining final LightGBM model on train + val...")
+        print("\nTraining final LightGBM model on train + val with TOP 30 features...")
         model = LGBMRegressor(**best_params)
         model.fit(X_train_val, y_train_val)
 
@@ -239,8 +268,9 @@ def main() -> None:
         lgbm_test_metrics = evaluate_regression(y_test, test_pred, prefix="test_")
 
         lgbm_metrics = {
-            "model": "lightgbm_final_train_val",
+            "model": "lightgbm_final_train_val_top30",
             "model_version": model_version,
+            "feature_count": int(len(feature_cols)),
             "train_rows": int(len(train_df)),
             "val_rows": int(len(val_df)),
             "train_val_rows": int(len(train_val_df)),
@@ -267,8 +297,8 @@ def main() -> None:
             }
         ).sort_values("importance", ascending=False)
 
-        print("\nTop 20 feature importances:")
-        print(importance_df.head(20))
+        print("\nTop 30 feature importances (selected set):")
+        print(importance_df.head(30))
 
         print("\nSaving artifacts...")
 
@@ -281,6 +311,8 @@ def main() -> None:
             {
                 "model_path": model_path.as_posix(),
                 "model_version": model_version,
+                "feature_count": len(feature_cols),
+                "best_features_path": BEST_FEATURES_PATH.as_posix(),
             },
             model_info_path,
         )
@@ -316,6 +348,7 @@ def main() -> None:
         }
         save_json(split_summary, ARTIFACTS_DIR / "split_summary.json")
 
+        mlflow.log_artifact(str(BEST_FEATURES_PATH))
         mlflow.log_artifact(str(model_info_path))
         mlflow.log_artifact(str(ARTIFACTS_DIR / "baseline_test_metrics.json"))
         mlflow.log_artifact(str(ARTIFACTS_DIR / "lgbm_test_metrics.json"))
