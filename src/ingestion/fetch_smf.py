@@ -51,15 +51,40 @@ def get_tgt(username: str, password: str) -> str:
     return tgt
 
 
+def get_safe_past_end_date_str() -> str:
+    """
+    EPİAŞ SMF endpoint requires endDate to be in the past.
+    Use yesterday (Europe/Istanbul) as the safe upper bound.
+    """
+    now_tr = pd.Timestamp.now(tz="Europe/Istanbul")
+    safe_end = now_tr.normalize() - pd.Timedelta(days=1)
+    return safe_end.strftime("%Y-%m-%d")
+
+
+def clamp_end_date_to_safe_past(end_date: str) -> str:
+    requested_end = pd.Timestamp(end_date)
+    safe_end = pd.Timestamp(get_safe_past_end_date_str())
+    effective_end = min(requested_end, safe_end)
+    return effective_end.strftime("%Y-%m-%d")
+
+
 def fetch_smf_raw(start_date: str, end_date: str, tgt: str) -> dict:
     headers = {
         "TGT": tgt,
         "Content-Type": "application/json",
     }
 
+    safe_end_date = clamp_end_date_to_safe_past(end_date)
+
+    if pd.Timestamp(start_date) > pd.Timestamp(safe_end_date):
+        raise ValueError(
+            f"Invalid SMF request window after clamping: "
+            f"start_date={start_date}, end_date={safe_end_date}"
+        )
+
     payload = {
         "startDate": f"{start_date}T00:00:00+03:00",
-        "endDate": f"{end_date}T23:59:59+03:00",
+        "endDate": f"{safe_end_date}T23:59:59+03:00",
     }
 
     r = requests.post(SMF_URL, headers=headers, json=payload, timeout=60)
@@ -202,6 +227,8 @@ def resolve_fetch_window(
 ) -> tuple[str, str]:
     last_ts = get_last_timestamp_from_parquet_dataset(out_dir)
 
+    safe_end_date = get_safe_past_end_date_str()
+
     if last_ts is None:
         start_date = default_start_date
         print("No existing raw dataset found. Starting full backfill.")
@@ -211,7 +238,7 @@ def resolve_fetch_window(
         print(f"Last timestamp found: {last_ts}")
         print(f"Using overlap of {overlap_days} day(s).")
 
-    end_date = pd.Timestamp.now(tz="Europe/Istanbul").strftime("%Y-%m-%d")
+    end_date = safe_end_date
     return start_date, end_date
 
 
@@ -228,8 +255,21 @@ def build_fetch_ranges(
         print("Manual ranges mode is ACTIVE.")
         ranges: list[tuple[str, str]] = []
 
+        safe_end = pd.Timestamp(get_safe_past_end_date_str())
+
         for rs, re in MANUAL_RANGES:
-            for s, e in daterange_chunks(rs, re, CHUNK_DAYS):
+            rs_ts = pd.Timestamp(rs)
+            re_ts = min(pd.Timestamp(re), safe_end)
+
+            if rs_ts > re_ts:
+                print(f"Skipping manual range outside safe past window: {rs} -> {re}")
+                continue
+
+            for s, e in daterange_chunks(
+                rs_ts.strftime("%Y-%m-%d"),
+                re_ts.strftime("%Y-%m-%d"),
+                CHUNK_DAYS,
+            ):
                 ranges.append((s, e))
 
         return ranges
@@ -255,12 +295,24 @@ def fetch_single_chunk(
     username: str,
     password: str,
 ) -> tuple[bool, int, str]:
+    safe_end_date = clamp_end_date_to_safe_past(end_date)
+
+    if pd.Timestamp(start_date) > pd.Timestamp(safe_end_date):
+        print(
+            f"Skipping invalid/present-future chunk after clamp: "
+            f"{start_date} -> {end_date} (effective_end={safe_end_date})"
+        )
+        return True, 0, tgt
+
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            print(f"Fetching: {start_date} -> {end_date} | attempt={attempt}/{MAX_RETRIES}")
+            print(
+                f"Fetching: {start_date} -> {safe_end_date} "
+                f"| attempt={attempt}/{MAX_RETRIES}"
+            )
 
-            raw = fetch_smf_raw(start_date, end_date, tgt)
-            df = raw_to_df(raw, start_date, end_date)
+            raw = fetch_smf_raw(start_date, safe_end_date, tgt)
+            df = raw_to_df(raw, start_date, safe_end_date)
 
             if df is None or df.empty:
                 print("  No rows returned for this chunk.")
@@ -278,7 +330,7 @@ def fetch_single_chunk(
 
             if status == 429:
                 print(
-                    f"  429 rate limit on {start_date}->{end_date}. "
+                    f"  429 rate limit on {start_date}->{safe_end_date}. "
                     f"Waiting {RATE_LIMIT_WAIT_SECONDS} seconds..."
                 )
                 time.sleep(RATE_LIMIT_WAIT_SECONDS)
@@ -290,15 +342,15 @@ def fetch_single_chunk(
                 time.sleep(3)
                 continue
 
-            print(f"  HTTPError on {start_date}->{end_date}: {ex}")
+            print(f"  HTTPError on {start_date}->{safe_end_date}: {ex}")
             time.sleep(ERROR_SLEEP_SECONDS)
 
         except requests.RequestException as ex:
-            print(f"  RequestException on {start_date}->{end_date}: {ex}")
+            print(f"  RequestException on {start_date}->{safe_end_date}: {ex}")
             time.sleep(ERROR_SLEEP_SECONDS)
 
         except Exception as ex:
-            print(f"  Error on {start_date}->{end_date}: {ex}")
+            print(f"  Error on {start_date}->{safe_end_date}: {ex}")
             time.sleep(ERROR_SLEEP_SECONDS)
 
     return False, 0, tgt
