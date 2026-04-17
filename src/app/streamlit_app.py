@@ -11,7 +11,7 @@ import streamlit as st
 # ─── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="PTF Forecast",
-    page_icon="⚡",
+    page_icon="",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -221,24 +221,18 @@ st.markdown("""
     gap: .35rem !important;
   }
 
-	/* DATE PICKER FULL */
-	section[data-testid="stSidebar"] [data-testid="stDateInput"] input {
-		background-color: #1f2937 !important;
-		color: #f3f4f6 !important;
-		border-radius: 10px !important;
-		border: 1px solid #4b5563 !important;
-		padding: 8px !important;
-	}
+  section[data-testid="stSidebar"] [data-testid="stDateInput"] input {
+    background-color: #1f2937 !important;
+    color: #f3f4f6 !important;
+    border-radius: 10px !important;
+    border: 1px solid #4b5563 !important;
+    padding: 8px !important;
+  }
 
-	/* iç yazı */
-	section[data-testid="stSidebar"] [data-testid="stDateInput"] input {
-		color: #f9fafb !important;
-	}
+  section[data-testid="stSidebar"] [data-testid="stDateInput"] input::placeholder {
+    color: #9ca3af !important;
+  }
 
-	/* placeholder */
-	section[data-testid="stSidebar"] [data-testid="stDateInput"] input::placeholder {
-		color: #9ca3af !important;
-	}
   .stTabs [data-baseweb="tab"] {
     font-family: var(--mono) !important;
     font-size: .72rem !important;
@@ -310,11 +304,6 @@ st.markdown("""
     background: rgba(31,41,55,0.94) !important;
   }
 
-  .stCheckbox label,
-  label[data-testid="stWidgetLabel"] {
-    color: var(--text) !important;
-  }
-
   .stJson {
     background: rgba(31,41,55,0.92) !important;
     border: 1px solid rgba(159,176,199,0.14) !important;
@@ -325,9 +314,16 @@ st.markdown("""
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parents[2] if "__file__" in globals() else Path.cwd()
-EVAL_PATH    = PROJECT_ROOT / "data" / "evaluation" / "ptf" / "ptf_prediction_evaluation.parquet"
+
+EVAL_PATH = PROJECT_ROOT / "data" / "evaluation" / "ptf" / "ptf_prediction_evaluation.parquet"
 SUMMARY_PATH = PROJECT_ROOT / "data" / "evaluation" / "ptf" / "ptf_prediction_evaluation_summary.json"
-PRED_PATH    = PROJECT_ROOT / "data" / "predictions" / "ptf" / "ptf_predictions_history.parquet"
+PRED_PATH = PROJECT_ROOT / "data" / "predictions" / "ptf" / "ptf_predictions_history.parquet"
+
+DECISION_PATH = PROJECT_ROOT / "data" / "decision" / "ptf" / "ptf_decision_signals.parquet"
+DECISION_SUMMARY_PATH = PROJECT_ROOT / "data" / "decision" / "ptf" / "ptf_decision_summary.json"
+
+SIM_PATH = PROJECT_ROOT / "data" / "decision" / "ptf" / "ptf_strategy_simulation.parquet"
+SIM_SUMMARY_PATH = PROJECT_ROOT / "data" / "decision" / "ptf" / "ptf_strategy_simulation_summary.json"
 
 # ─── Plotly theme ─────────────────────────────────────────────────────────────
 PLOTLY_LAYOUT = dict(
@@ -367,6 +363,8 @@ COLORS = dict(
     pred_future="#34d399",
     baseline="#f59e0b",
     mae="#f87171",
+    strategy="#22c55e",
+    risk="#ef4444",
 )
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -412,11 +410,79 @@ def load_prediction_data(path: Path) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
+def load_decision_data(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    df = pd.read_parquet(path)
+    if "forecast_time" in df.columns:
+        df["forecast_time"] = to_naive_datetime(df["forecast_time"])
+        df = df.sort_values("forecast_time").reset_index(drop=True)
+
+    numeric_cols = [
+        "y_pred", "pred_mean_horizon", "pred_std_horizon", "pred_vs_mean_ratio",
+        "pred_zscore_horizon", "pred_diff_1", "pred_abs_diff_1", "local_volatility",
+        "risk_score"
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def load_simulation_data(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    df = pd.read_parquet(path)
+    if "forecast_time" in df.columns:
+        df["forecast_time"] = to_naive_datetime(df["forecast_time"])
+        df = df.sort_values("forecast_time").reset_index(drop=True)
+
+    numeric_cols = [
+        "y_pred", "ptf", "smf", "baseline_bid_mwh", "strategy_multiplier",
+        "strategy_bid_mwh", "actual_generation_mwh", "baseline_imbalance_mwh",
+        "strategy_imbalance_mwh", "baseline_dayahead_revenue",
+        "strategy_dayahead_revenue", "baseline_imbalance_cashflow",
+        "strategy_imbalance_cashflow", "baseline_total_revenue",
+        "strategy_total_revenue", "delta_dayahead_revenue",
+        "delta_imbalance_cashflow", "delta_total_revenue",
+        "baseline_abs_imbalance_mwh", "strategy_abs_imbalance_mwh",
+        "delta_abs_imbalance_mwh"
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df
+
+
+@st.cache_data(show_spinner=False)
 def safe_json_summary(path: Path) -> dict:
     if not path.exists():
         return {}
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+def format_for_display(df: pd.DataFrame, formats: dict[str, str] | None = None) -> pd.DataFrame:
+    """Return a copy with selected numeric columns formatted as strings.
+    Avoids Pandas Styler limits inside Streamlit.
+    """
+    if df.empty:
+        return df.copy()
+
+    out = df.copy()
+    if not formats:
+        return out
+
+    for col, fmt in formats.items():
+        if col not in out.columns:
+            continue
+        mask = out[col].notna()
+        out[col] = out[col].astype(object)
+        out.loc[mask, col] = out.loc[mask, col].map(lambda x: fmt.format(x))
+    return out
+
 
 
 def filter_to_latest_run(df: pd.DataFrame) -> pd.DataFrame:
@@ -538,6 +604,8 @@ def get_prediction_status(pred_df: pd.DataFrame) -> dict:
         status["is_stale"] = status["latest_forecast_time"] < today_start
 
     return status
+
+
 def get_upcoming_24h_predictions(pred_df: pd.DataFrame) -> pd.DataFrame:
     if pred_df.empty or "forecast_time" not in pred_df.columns:
         return pd.DataFrame()
@@ -561,6 +629,7 @@ def get_upcoming_24h_predictions(pred_df: pd.DataFrame) -> pd.DataFrame:
     ].copy()
 
     return out.sort_values("forecast_time").reset_index(drop=True)
+
 
 # ─── Chart builders ───────────────────────────────────────────────────────────
 def build_main_chart(chart_df: pd.DataFrame, show_baseline: bool = True) -> go.Figure:
@@ -721,11 +790,170 @@ def build_error_dist_chart(error_view: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def build_decision_chart(decision_df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    if decision_df.empty:
+        return fig
+
+    fig.add_trace(go.Scatter(
+        x=decision_df["forecast_time"],
+        y=decision_df["y_pred"],
+        mode="lines+markers",
+        name="Forecast Price",
+        line=dict(color=COLORS["pred_future"], width=2.4),
+        marker=dict(size=6),
+        hovertemplate="<b>%{x}</b><br>y_pred: %{y:,.2f}<extra></extra>",
+    ))
+
+    if "risk_score" in decision_df.columns:
+        risky = decision_df[decision_df["risk_score"] >= 1.5].copy()
+        if not risky.empty:
+            fig.add_trace(go.Scatter(
+                x=risky["forecast_time"],
+                y=risky["y_pred"],
+                mode="markers",
+                name="Risky Hours",
+                marker=dict(color=COLORS["risk"], size=11, symbol="diamond"),
+                hovertemplate="<b>%{x}</b><br>risk_score: %{customdata:.2f}<extra></extra>",
+                customdata=risky["risk_score"],
+            ))
+
+    layout = dict(**PLOTLY_LAYOUT)
+    layout.update(height=430, title=dict(text="Decision Signals over Forecast Horizon", font=dict(size=13, color="#e2e8f0")))
+    fig.update_layout(**layout)
+    fig.update_xaxes(title_text="Forecast Time", title_font=dict(size=10))
+    fig.update_yaxes(title_text="Forecast PTF", title_font=dict(size=10))
+    return fig
+
+
+def build_strategy_revenue_chart(sim_df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    if sim_df.empty:
+        return fig
+
+    if "delta_total_revenue" not in sim_df.columns:
+        return fig
+
+    delta = pd.to_numeric(sim_df["delta_total_revenue"], errors="coerce")
+
+    fig.add_trace(go.Bar(
+        x=sim_df["forecast_time"],
+        y=delta,
+        name="Delta Revenue",
+        hovertemplate="<b>%{x}</b><br>Δ Revenue: %{y:,.2f}<extra></extra>",
+    ))
+
+    fig.add_hline(y=0, line_dash="dash", line_color="#94a3b8")
+
+    layout = dict(**PLOTLY_LAYOUT)
+    layout.update(
+        height=380,
+        title=dict(
+            text="Strategy Revenue Improvement vs Baseline",
+            font=dict(size=13, color="#e2e8f0"),
+        ),
+    )
+    fig.update_layout(**layout)
+    fig.update_xaxes(title_text="Forecast Time", title_font=dict(size=10))
+    fig.update_yaxes(title_text="Delta Revenue", title_font=dict(size=10))
+    return fig
+def build_strategy_multiplier_chart(sim_df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    if sim_df.empty or "strategy_multiplier" not in sim_df.columns:
+        return fig
+
+    mult = pd.to_numeric(sim_df["strategy_multiplier"], errors="coerce")
+
+    fig.add_trace(go.Scatter(
+        x=sim_df["forecast_time"],
+        y=mult,
+        mode="lines+markers",
+        name="Strategy Multiplier",
+        line=dict(color=COLORS["pred_future"], width=2.2),
+        marker=dict(size=4),
+        hovertemplate="<b>%{x}</b><br>Multiplier: %{y:.3f}<extra></extra>",
+    ))
+
+    fig.add_hline(y=1.0, line_dash="dash", line_color="#94a3b8")
+
+    layout = dict(**PLOTLY_LAYOUT)
+    layout.update(
+        height=320,
+        title=dict(
+            text="Strategy Multiplier Over Time",
+            font=dict(size=13, color="#e2e8f0"),
+        ),
+    )
+    fig.update_layout(**layout)
+    fig.update_xaxes(title_text="Forecast Time", title_font=dict(size=10))
+    fig.update_yaxes(title_text="Multiplier", title_font=dict(size=10))
+    return fig
+
+
+def build_bid_difference_chart(sim_df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    required = {"baseline_bid_mwh", "strategy_bid_mwh"}
+    if sim_df.empty or not required.issubset(sim_df.columns):
+        return fig
+
+    baseline_bid = pd.to_numeric(sim_df["baseline_bid_mwh"], errors="coerce")
+    strategy_bid = pd.to_numeric(sim_df["strategy_bid_mwh"], errors="coerce")
+    bid_diff = strategy_bid - baseline_bid
+
+    fig.add_trace(go.Bar(
+        x=sim_df["forecast_time"],
+        y=bid_diff,
+        name="Bid Difference",
+        hovertemplate="<b>%{x}</b><br>Strategy - Baseline: %{y:,.2f} MWh<extra></extra>",
+    ))
+
+    fig.add_hline(y=0, line_dash="dash", line_color="#94a3b8")
+
+    layout = dict(**PLOTLY_LAYOUT)
+    layout.update(
+        height=320,
+        title=dict(
+            text="Strategy Bid Difference vs Baseline",
+            font=dict(size=13, color="#e2e8f0"),
+        ),
+    )
+    fig.update_layout(**layout)
+    fig.update_xaxes(title_text="Forecast Time", title_font=dict(size=10))
+    fig.update_yaxes(title_text="Δ Bid (MWh)", title_font=dict(size=10))
+    return fig
+
+def build_strategy_delta_chart(sim_df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    if sim_df.empty or "delta_total_revenue" not in sim_df.columns:
+        return fig
+
+    fig.add_trace(go.Bar(
+        x=sim_df["forecast_time"],
+        y=sim_df["delta_total_revenue"],
+        name="Delta Total Revenue",
+        hovertemplate="<b>%{x}</b><br>Δ Revenue: %{y:,.2f}<extra></extra>",
+    ))
+
+    fig.add_hline(y=0, line_dash="dash", line_color="#94a3b8")
+    layout = dict(**PLOTLY_LAYOUT)
+    layout.update(height=340, title=dict(text="Strategy Gain/Loss by Hour", font=dict(size=13, color="#e2e8f0")))
+    fig.update_layout(**layout)
+    fig.update_xaxes(title_text="Forecast Time", title_font=dict(size=10))
+    fig.update_yaxes(title_text="Delta Revenue", title_font=dict(size=10))
+    return fig
+
+
 # ─── Load data ────────────────────────────────────────────────────────────────
 try:
     eval_df = load_eval_data(EVAL_PATH)
     pred_df = load_prediction_data(PRED_PATH)
     summary = safe_json_summary(SUMMARY_PATH)
+
+    decision_df = load_decision_data(DECISION_PATH)
+    decision_summary = safe_json_summary(DECISION_SUMMARY_PATH)
+
+    sim_df = load_simulation_data(SIM_PATH)
+    sim_summary = safe_json_summary(SIM_SUMMARY_PATH)
 except Exception as e:
     st.markdown(f'<div class="error-banner">⚠ {e}</div>', unsafe_allow_html=True)
     st.stop()
@@ -766,9 +994,12 @@ with st.sidebar:
 
     if "forecast_time" in eval_df.columns and not eval_df.empty:
         all_times.append(eval_df["forecast_time"].dropna())
-
     if "forecast_time" in pred_df.columns and not pred_df.empty:
         all_times.append(pred_df["forecast_time"].dropna())
+    if "forecast_time" in decision_df.columns and not decision_df.empty:
+        all_times.append(decision_df["forecast_time"].dropna())
+    if "forecast_time" in sim_df.columns and not sim_df.empty:
+        all_times.append(sim_df["forecast_time"].dropna())
 
     now, today_start, today_end = get_today_bounds()
 
@@ -813,6 +1044,14 @@ if only_actuals and "actual_available" in filtered_df.columns:
     filtered_df = filtered_df[filtered_df["actual_available"]].copy()
 filtered_df = filtered_df.sort_values("forecast_time").reset_index(drop=True)
 
+filtered_decision_df = apply_date_filter(decision_df, date_range)
+filtered_decision_df = deduplicate_forecast_time(filtered_decision_df)
+filtered_decision_df = filtered_decision_df.sort_values("forecast_time").reset_index(drop=True)
+
+filtered_sim_df = apply_date_filter(sim_df, date_range)
+filtered_sim_df = deduplicate_forecast_time(filtered_sim_df)
+filtered_sim_df = filtered_sim_df.sort_values("forecast_time").reset_index(drop=True)
+
 metrics = compute_metrics(filtered_df)
 prediction_status = get_prediction_status(pred_df)
 now, today_start, today_end = get_today_bounds()
@@ -824,7 +1063,7 @@ st.markdown("""
   <span class="badge">EPİAŞ</span>
   <span class="badge">Live</span>
 </div>
-<p class="ptf-caption">Turkey Electricity Balancing Market · Piyasa Takas Fiyatı prediction &amp; evaluation monitor</p>
+<p class="ptf-caption">Turkey Electricity Balancing Market · Piyasa Takas Fiyatı prediction, decision & strategy monitor</p>
 """, unsafe_allow_html=True)
 
 if pred_df.empty:
@@ -854,8 +1093,6 @@ else:
         )
 
 # ─── Metric cards ─────────────────────────────────────────────────────────────
-bias_txt, bias_color = bias_label(metrics["bias"])
-
 col1, col2, col3, col4, col5, col6 = st.columns(6)
 
 with col1:
@@ -871,8 +1108,8 @@ with col5:
 with col6:
     st.metric("Bias", "—" if metrics["bias"] is None else f"{metrics['bias']:.2f}")
 
-# ── Status banners ────────────────────────────────────────────────────────────
 if metrics["bias"] is not None:
+    bias_txt, _ = bias_label(metrics["bias"])
     icon = "↑" if metrics["bias"] > 0 else "↓" if metrics["bias"] < 0 else "="
     st.markdown(f'<div class="info-banner">{icon} Bias: {bias_txt}</div>', unsafe_allow_html=True)
 
@@ -881,11 +1118,13 @@ if metrics["mape"] is not None:
     st.markdown(f'<div class="{mape_color}">MAPE: {metrics["mape"]:.2f}% — note: can be unstable for near-zero prices</div>', unsafe_allow_html=True)
 
 # ─── Tabs ─────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs([
-    "📈  Forecast Overview",
-    "🎯  Error Analysis",
-    "🔭  Latest Forecast",
-    "🗃  Data Preview",
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "Forecast Overview",
+    "Error Analysis",
+    "Latest Forecast",
+    "Decision Signals",
+    "Strategy Simulation",
+    "Data Preview",
 ])
 
 # ══════════════════════ TAB 1: Forecast Overview ══════════════════════════════
@@ -908,11 +1147,14 @@ with tab1:
                 "prediction_type", "model_version", "created_at", "evaluation_created_at",
             ] if c in chart_df.columns]
             st.dataframe(
-                chart_df[preview_cols].tail(50).style.format({
-                    "y_pred": "{:,.2f}", "y_true": "{:,.2f}",
-                    "error": "{:,.2f}", "abs_error": "{:,.2f}",
-                    "lag_24": "{:,.2f}",
-                }),
+                format_for_display(
+                    chart_df[preview_cols].tail(50),
+                    {
+                        "y_pred": "{:,.2f}", "y_true": "{:,.2f}",
+                        "error": "{:,.2f}", "abs_error": "{:,.2f}",
+                        "lag_24": "{:,.2f}",
+                    },
+                ),
                 use_container_width=True,
                 height=380,
             )
@@ -931,9 +1173,12 @@ with tab1:
                     "forecast_time", "y_pred", "lag_24", "prediction_type", "model_version",
                 ] if c in future_rows.columns]
                 st.dataframe(
-                    future_rows[future_cols].head(48).style.format({
-                        "y_pred": "{:,.2f}", "lag_24": "{:,.2f}",
-                    }),
+                    format_for_display(
+                        future_rows[future_cols].head(48),
+                        {
+                            "y_pred": "{:,.2f}", "lag_24": "{:,.2f}",
+                        },
+                    ),
                     use_container_width=True,
                     height=380,
                 )
@@ -971,11 +1216,14 @@ with tab2:
 
             st.markdown('<p class="section-header">Top 20 worst forecast errors</p>', unsafe_allow_html=True)
             st.dataframe(
-                worst_rows[worst_cols].style.format({
-                    "y_pred": "{:,.2f}", "y_true": "{:,.2f}",
-                    "error": "{:,.2f}", "abs_error": "{:,.2f}",
-                    "lag_24": "{:,.2f}",
-                }).background_gradient(subset=["abs_error"] if "abs_error" in worst_cols else [], cmap="Reds"),
+                format_for_display(
+                    worst_rows[worst_cols],
+                    {
+                        "y_pred": "{:,.2f}", "y_true": "{:,.2f}",
+                        "error": "{:,.2f}", "abs_error": "{:,.2f}",
+                        "lag_24": "{:,.2f}",
+                    },
+                ),
                 use_container_width=True,
             )
 
@@ -997,10 +1245,13 @@ with tab3:
                 unsafe_allow_html=True,
             )
             st.dataframe(
-                latest_df.style.format({
-                    "y_pred": "{:,.2f}",
-                    "lag_24": "{:,.2f}",
-                }),
+                format_for_display(
+                    latest_df,
+                    {
+                        "y_pred": "{:,.2f}",
+                        "lag_24": "{:,.2f}",
+                    },
+                ),
                 use_container_width=True,
                 height=420,
             )
@@ -1032,7 +1283,7 @@ with tab3:
             ]
 
             st.dataframe(
-                upcoming_df[show_cols].style.format(fmt),
+                format_for_display(upcoming_df[show_cols], fmt),
                 use_container_width=True,
                 height=460,
             )
@@ -1095,8 +1346,126 @@ with tab3:
             forecast_fig.update_yaxes(title_text="PTF (TL/MWh)", title_font=dict(size=10))
 
             st.plotly_chart(forecast_fig, use_container_width=True)
-# ══════════════════════ TAB 4: Data Preview ═══════════════════════════════════
+
+# ══════════════════════ TAB 4: Decision Signals ═══════════════════════════════
 with tab4:
+    if filtered_decision_df.empty:
+        st.markdown('<div class="warn-banner">⚠ Decision signals dosyası boş ya da seçilen tarihte veri yok.</div>', unsafe_allow_html=True)
+    else:
+        d1, d2, d3, d4 = st.columns(4)
+
+        signal_counts = decision_summary.get("signal_counts", {})
+        risk_counts = decision_summary.get("risk_counts", {})
+
+        with d1:
+            st.metric("Decision Rows", f"{len(filtered_decision_df):,}")
+        with d2:
+            st.metric("High Value Hours", signal_counts.get("HIGH_VALUE_HOUR", 0))
+        with d3:
+            st.metric("High Risk Hours", risk_counts.get("high_risk", 0))
+        with d4:
+            avg_pred = decision_summary.get("avg_pred")
+            st.metric("Avg Pred", "—" if avg_pred is None else f"{avg_pred:,.2f}")
+
+        st.plotly_chart(build_decision_chart(filtered_decision_df.tail(chart_window)), use_container_width=True)
+
+        c1, c2 = st.columns([3, 2], gap="medium")
+
+        with c1:
+            st.markdown('<p class="section-header">Decision signal table</p>', unsafe_allow_html=True)
+            show_cols = [c for c in [
+                "forecast_time", "y_pred", "price_regime", "risk_score", "risk_label",
+                "decision_signal", "decision_note", "pred_zscore_horizon",
+                "pred_abs_diff_1", "local_volatility"
+            ] if c in filtered_decision_df.columns]
+
+            st.dataframe(
+                format_for_display(
+                    filtered_decision_df[show_cols],
+                    {
+                        "y_pred": "{:,.2f}",
+                        "risk_score": "{:.2f}",
+                        "pred_zscore_horizon": "{:.2f}",
+                        "pred_abs_diff_1": "{:,.2f}",
+                        "local_volatility": "{:,.2f}",
+                    },
+                ),
+                use_container_width=True,
+                height=430,
+            )
+
+        with c2:
+            st.markdown('<p class="section-header">Decision summary JSON</p>', unsafe_allow_html=True)
+            st.json(decision_summary if decision_summary else {"info": "decision summary not found"})
+
+# ══════════════════════ TAB 5: Strategy Simulation ════════════════════════════
+with tab5:
+    if filtered_sim_df.empty:
+        st.markdown('<div class="warn-banner">⚠ Strategy simulation dosyası boş ya da seçilen tarihte veri yok.</div>', unsafe_allow_html=True)
+    else:
+        s1, s2, s3, s4 = st.columns(4)
+
+        with s1:
+            val = sim_summary.get("total_baseline_revenue")
+            st.metric("Baseline Revenue", "—" if val is None else f"{val:,.0f}")
+        with s2:
+            val = sim_summary.get("total_strategy_revenue")
+            st.metric("Strategy Revenue", "—" if val is None else f"{val:,.0f}")
+        with s3:
+            val = sim_summary.get("total_gain")
+            st.metric("Total Gain", "—" if val is None else f"{val:,.0f}")
+        with s4:
+            val = sim_summary.get("imbalance_reduction_mwh")
+            st.metric("Imbalance Reduction", "—" if val is None else f"{val:,.2f}")
+        
+        c1, c2 = st.columns(2, gap="medium")
+        with c1:
+            st.plotly_chart(build_strategy_revenue_chart(filtered_sim_df.tail(chart_window)), use_container_width=True)
+        with c2:
+            st.plotly_chart(build_strategy_multiplier_chart(filtered_sim_df.tail(chart_window)), use_container_width=True)
+
+        st.plotly_chart(
+            build_bid_difference_chart(filtered_sim_df.tail(chart_window)),
+            use_container_width=True,
+        )
+
+        st.markdown('<p class="section-header">Strategy simulation table</p>', unsafe_allow_html=True)
+        show_cols = [c for c in [
+            "forecast_time", "decision_signal", "risk_label", "y_pred", "ptf", "smf",
+            "baseline_bid_mwh", "strategy_multiplier", "strategy_bid_mwh",
+            "actual_generation_mwh", "baseline_total_revenue", "strategy_total_revenue",
+            "delta_total_revenue", "baseline_abs_imbalance_mwh",
+            "strategy_abs_imbalance_mwh", "delta_abs_imbalance_mwh"
+        ] if c in filtered_sim_df.columns]
+
+        st.dataframe(
+            format_for_display(
+                filtered_sim_df[show_cols],
+                {
+                    "y_pred": "{:,.2f}",
+                    "ptf": "{:,.2f}",
+                    "smf": "{:,.2f}",
+                    "baseline_bid_mwh": "{:,.2f}",
+                    "strategy_multiplier": "{:.2f}",
+                    "strategy_bid_mwh": "{:,.2f}",
+                    "actual_generation_mwh": "{:,.2f}",
+                    "baseline_total_revenue": "{:,.2f}",
+                    "strategy_total_revenue": "{:,.2f}",
+                    "delta_total_revenue": "{:,.2f}",
+                    "baseline_abs_imbalance_mwh": "{:,.2f}",
+                    "strategy_abs_imbalance_mwh": "{:,.2f}",
+                    "delta_abs_imbalance_mwh": "{:,.2f}",
+                },
+            ),
+            use_container_width=True,
+            height=460,
+        )
+
+        st.markdown('<p class="section-header">Strategy summary JSON</p>', unsafe_allow_html=True)
+        st.json(sim_summary if sim_summary else {"info": "simulation summary not found"})
+
+# ══════════════════════ TAB 6: Data Preview ═══════════════════════════════════
+with tab6:
     c1, c2, c3 = st.columns([2, 1, 1], gap="medium")
 
     with c1:
