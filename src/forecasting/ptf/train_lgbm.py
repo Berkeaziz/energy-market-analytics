@@ -59,6 +59,27 @@ def load_best_features(path: str | Path) -> list[str]:
 
     return best_features
 
+def compute_recency_weights(
+    dates: pd.Series,
+    half_life_years: float = 2.5,
+    min_weight: float = 0.20,
+    max_weight: float = 1.00,
+) -> np.ndarray:
+    dates = pd.to_datetime(dates, errors="coerce")
+
+    if dates.isna().any():
+        raise ValueError("DATE_COL contains invalid datetimes; cannot compute sample weights.")
+
+    max_date = dates.max()
+    age_days = (max_date - dates).dt.days.astype(float)
+
+    half_life_days = 365.25 * half_life_years
+    decay_lambda = np.log(2.0) / half_life_days
+
+    weights = np.exp(-decay_lambda * age_days)
+    weights = np.clip(weights, min_weight, max_weight)
+
+    return weights.astype(np.float32)
 
 def load_features(path: str | Path) -> pd.DataFrame:
     path = Path(path)
@@ -192,6 +213,16 @@ def main() -> None:
     train_df, val_df, test_df = chronological_split(df)
     train_val_df = pd.concat([train_df, val_df], axis=0).copy()
 
+    train_val_weights = compute_recency_weights(
+        train_val_df[DATE_COL],
+        half_life_years=2.5,
+        min_weight=0.20,
+        max_weight=1.00,
+    )
+
+    print("\nSample weight summary (train+val):")
+    print(f"min={train_val_weights.min():.4f}, max={train_val_weights.max():.4f}, mean={train_val_weights.mean():.4f}")
+
     X_train_val = train_val_df[feature_cols].copy()
     y_train_val = train_val_df[TARGET_COL].copy()
 
@@ -236,7 +267,10 @@ def main() -> None:
 
     with mlflow.start_run(run_name="lightgbm_final_train_val_top30"):
         mlflow.set_tag("model_version", model_version)
-
+        mlflow.log_param("sample_weighting", "recency_exponential")
+        mlflow.log_param("sample_weight_half_life_years", 2.5)
+        mlflow.log_param("sample_weight_min", 0.20)
+        mlflow.log_param("sample_weight_max", 1.00)
         mlflow.log_param("model_type", "LGBMRegressor")
         mlflow.log_param("target_col", TARGET_COL)
         mlflow.log_param("baseline_col", BASELINE_COL)
@@ -261,7 +295,11 @@ def main() -> None:
 
         print("\nTraining final LightGBM model on train + val with TOP 30 features...")
         model = LGBMRegressor(**best_params)
-        model.fit(X_train_val, y_train_val)
+        model.fit(
+            X_train_val,
+            y_train_val,
+            sample_weight=train_val_weights,
+        )
 
         test_pred = model.predict(X_test)
 
