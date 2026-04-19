@@ -90,6 +90,31 @@ def ensure_naive_datetime(series: pd.Series) -> pd.Series:
         series = series.dt.tz_localize(None)
     return series
 
+def log_external_missing_state(df: pd.DataFrame) -> None:
+    external_cols = [
+        c for c in df.columns
+        if c.startswith(("gen_", "cons_", "smf_", "weather_"))
+    ]
+    if not external_cols:
+        print("No external columns found for missing-state logging.")
+        return
+
+    summary = _missing_summary(df.reset_index(), external_cols, "external features current state")
+    print("\n[External Missing State Snapshot]")
+    print(f"Rows: {summary['rows']}")
+    print(f"Total missing cells: {summary['total_missing_cells']}")
+
+    worst_cols = sorted(
+        summary["columns"].items(),
+        key=lambda x: x[1]["missing_count"],
+        reverse=True
+    )[:15]
+
+    for col, stats in worst_cols:
+        print(
+            f"  - {col}: missing={stats['missing_count']} "
+            f"({stats['missing_ratio_pct']}%)"
+        )
 
 def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -585,9 +610,66 @@ def load_forecast_data(path: str | Path, expected_prefix: str) -> pd.DataFrame |
 
     return df
 
+def _missing_summary(df: pd.DataFrame, cols: list[str], label: str) -> dict:
+    summary = {
+        "label": label,
+        "rows": int(len(df)),
+        "columns": {},
+        "total_missing_cells": 0,
+    }
 
-def fill_with_forecast(base_df: pd.DataFrame, forecast_df: pd.DataFrame | None, prefix: str) -> pd.DataFrame:
+    for col in cols:
+        missing_count = int(df[col].isna().sum()) if col in df.columns else int(len(df))
+        missing_ratio = (missing_count / len(df) * 100.0) if len(df) > 0 else 0.0
+
+        summary["columns"][col] = {
+            "missing_count": missing_count,
+            "missing_ratio_pct": round(missing_ratio, 2),
+        }
+        summary["total_missing_cells"] += missing_count
+
+    return summary
+
+
+def _print_missing_summary(before: dict, after: dict, filled_from_forecast: dict | None = None) -> None:
+    label = before["label"]
+    print(f"\n[Missing Summary] {label}")
+    print(f"Rows: {before['rows']}")
+
+    total_before = before["total_missing_cells"]
+    total_after = after["total_missing_cells"]
+    total_filled = total_before - total_after
+
+    print(f"Total missing before fill : {total_before}")
+    print(f"Total missing after fill  : {total_after}")
+    print(f"Total filled             : {total_filled}")
+
+    for col in before["columns"]:
+        b = before["columns"][col]["missing_count"]
+        a = after["columns"][col]["missing_count"]
+        filled = b - a
+
+        extra = ""
+        if filled_from_forecast and col in filled_from_forecast:
+            extra = f" | forecast_used={filled_from_forecast[col]}"
+
+        print(
+            f"  - {col}: before={b}, after={a}, filled={filled}{extra}"
+        )
+
+
+def fill_with_forecast(
+    base_df: pd.DataFrame,
+    forecast_df: pd.DataFrame | None,
+    prefix: str,
+    log_missing: bool = True,
+) -> pd.DataFrame:
     if forecast_df is None:
+        if log_missing:
+            candidate_cols = [c for c in base_df.columns if c.startswith(prefix)]
+            if candidate_cols:
+                before = _missing_summary(base_df.reset_index(), candidate_cols, f"{prefix} (no forecast file)")
+                _print_missing_summary(before, before)
         return base_df
 
     df = base_df.copy().reset_index()
@@ -595,22 +677,43 @@ def fill_with_forecast(base_df: pd.DataFrame, forecast_df: pd.DataFrame | None, 
 
     forecast_cols = [c for c in fc.columns if c != DATE_COL and c.startswith(prefix)]
     if not forecast_cols:
+        if log_missing:
+            candidate_cols = [c for c in df.columns if c.startswith(prefix)]
+            if candidate_cols:
+                before = _missing_summary(df, candidate_cols, f"{prefix} (forecast has no matching cols)")
+                _print_missing_summary(before, before)
         return base_df
+
+    before_summary = _missing_summary(df, forecast_cols, f"{prefix} before fill") if log_missing else None
 
     rename_map = {col: f"{col}__forecast" for col in forecast_cols}
     fc = fc.rename(columns=rename_map)
 
     df = df.merge(fc, on=DATE_COL, how="left")
 
+    filled_from_forecast = {}
+
     for col in forecast_cols:
         fc_col = f"{col}__forecast"
+
         if col not in df.columns:
+            original_missing = len(df)
             df[col] = df[fc_col]
         else:
+            original_missing = int(df[col].isna().sum())
+            forecast_available_for_missing = int(df.loc[df[col].isna(), fc_col].notna().sum())
             df[col] = df[col].fillna(df[fc_col])
+
+        filled_from_forecast[col] = forecast_available_for_missing if col in df.columns else 0
+
+    after_summary = _missing_summary(df, forecast_cols, f"{prefix} after fill") if log_missing else None
 
     df = df.drop(columns=[f"{c}__forecast" for c in forecast_cols], errors="ignore")
     df = df.sort_values(DATE_COL, kind="mergesort").set_index(DATE_COL)
+
+    if log_missing and before_summary and after_summary:
+        _print_missing_summary(before_summary, after_summary, filled_from_forecast)
+
     return df
 
 
@@ -1205,7 +1308,26 @@ def run_ptf_feature_pipeline(
 
     print("Saving feature dataset...")
     save_features(df_final, output_path)
+    if mode in {"inference_latest", "inference_backfill"}:
+        if use_generation_forecast:
+            gen_fc_path = GEN_FORECAST_LATEST_PATH if mode == "inference_latest" else GEN_FORECAST_BACKFILL_PATH
+            print(f"Loading generation forecast parquet: {gen_fc_path}")
+            gen_forecast_df = load_forecast_data(gen_fc_path, expected_prefix="gen_")
+            df = fill_with_forecast(df, gen_forecast_df, prefix="gen_")
 
+        if use_consumption_forecast:
+            cons_fc_path = CONS_FORECAST_LATEST_PATH if mode == "inference_latest" else CONS_FORECAST_BACKFILL_PATH
+            print(f"Loading consumption forecast parquet: {cons_fc_path}")
+            cons_forecast_df = load_forecast_data(cons_fc_path, expected_prefix="cons_")
+            df = fill_with_forecast(df, cons_forecast_df, prefix="cons_")
+
+        if use_smf_forecast:
+            smf_fc_path = SMF_FORECAST_LATEST_PATH if mode == "inference_latest" else SMF_FORECAST_BACKFILL_PATH
+            print(f"Loading SMF forecast parquet: {smf_fc_path}")
+            smf_forecast_df = load_forecast_data(smf_fc_path, expected_prefix="smf_")
+            df = fill_with_forecast(df, smf_forecast_df, prefix="smf_")
+
+        log_external_missing_state(df)
     print("Done.")
     print(f"Pipeline        : ptf")
     print(f"Mode            : {mode}")
