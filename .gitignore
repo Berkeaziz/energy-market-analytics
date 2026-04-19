@@ -1,0 +1,6 @@
+/data/*
+/artifacts*
+/mlruns
+/airflow
+/mlflow.db
+/.env
