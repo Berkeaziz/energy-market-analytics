@@ -4,3 +4,4 @@
 /airflow
 /mlflow.db
 /.env
+/notebooks
