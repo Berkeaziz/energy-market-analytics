@@ -7,6 +7,9 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
+
+st_autorefresh(interval=5 * 60 * 1000, key="auto_refresh")
 
 st.set_page_config(
     page_title="PTF Forecast",
