@@ -1,7 +1,12 @@
-<<<<<<< HEAD
 # Energy Market Analytics
 
 A modular energy market forecasting and decision-support system focused on Turkish electricity market PTF price prediction. Ingests EPİAŞ, generation, consumption, SMF, and weather data to produce hourly PTF forecasts, imbalance cost simulations, and trading decision signals.
+
+## Dashboard
+
+![PTF Forecast Dashboard](docs/dashboard.png)
+
+> Turkey Electricity Balancing Market · PTF prediction, decision & strategy monitor. Shows actual vs predicted PTF prices (TL/MWh), forecast window, evaluation metrics (MAE, RMSE, Bias), decision signals, and strategy simulation tabs.
 
 ## What it does
 
@@ -12,40 +17,30 @@ A modular energy market forecasting and decision-support system focused on Turki
 - Tracks experiments and model artifacts with MLflow
 - Provides an interactive Streamlit dashboard for monitoring predictions, signals, and evaluation metrics
 
-## Dashboard
-
-![PTF Forecast Dashboard](docs/dashboard.png)
-
-> Turkey Electricity Balancing Market · PTF prediction, decision & strategy monitor. Shows actual vs predicted PTF prices (TL/MWh), forecast window, evaluation metrics (MAE, RMSE, Bias), decision signals, and strategy simulation tabs.
-
 ## Architecture
 
-```
-Data Sources
-    │
-    ▼
-Ingestion (src/ingestion/)
-    │
-    ▼
-Processing & Feature Engineering (src/processing/ · src/features/)
-    │
-    ├──────────────────────────┐
-    ▼                          ▼
-Training                   Prediction
-(src/forecasting/ptf/)     (src/predict/ · src/decision/)
-(MLflow)                       │
-                               ▼
-                    Evaluation & Simulation
-                       (src/evalution/)
-                               │
-                               ▼
-                    Streamlit Dashboard
-                         (src/app/)
+```mermaid
+flowchart LR
+    A([Data Sources\nEPİAŞ · Weather · Generation\nConsumption · SMF])
+    B[Ingestion\nsrc/ingestion/]
+    C[Processing &\nFeature Engineering\nsrc/processing/ · src/features/]
+    D[Training\nsrc/forecasting/ptf/\nMLflow]
+    E[Prediction\nsrc/predict/\nsrc/decision/]
+    F[Evaluation &\nSimulation\nsrc/evalution/]
+    G([Streamlit Dashboard\nsrc/app/])
+    H{{Airflow\nairflow/dags/}}
 
-Airflow orchestrates all stages across three DAGs
+    A --> B --> C
+    C --> D --> E --> F --> G
+    H -.->|orchestrates| B
+    H -.->|orchestrates| C
+    H -.->|orchestrates| D
+    H -.->|orchestrates| E
 ```
 
 ## Pipelines
+
+Three Airflow DAGs cover the full ML lifecycle.
 
 ### `retrain_ptf_pipeline`
 
@@ -53,18 +48,26 @@ Airflow orchestrates all stages across three DAGs
 
 Fetches all source data, trains auxiliary models (generation, consumption, SMF) and the main LightGBM PTF model from scratch, and registers artifacts in MLflow.
 
-```
-fetch + process raw data
-    │
-    ├── build_generation_features (train) ──► train_generation
-    ├── build_consumption_features (train) ──► train_consumption
-    └── build_smf_features (train) ──► train_smf
-                                            │
-                               process_ptf + process_weather
-                                            │
-                                   build_features (ptf, train)
-                                            │
-                                        train_lgbm ──► MLflow
+```mermaid
+flowchart TD
+    A([fetch + process\nraw data])
+
+    A --> B[build_generation_features\ntrain]
+    A --> C[build_consumption_features\ntrain]
+    A --> D[build_smf_features\ntrain]
+
+    B --> E[train_generation]
+    C --> F[train_consumption]
+    D --> G[train_smf]
+
+    A --> H[process_ptf\nprocess_weather]
+    E --> I[build_features\nptf · train]
+    F --> I
+    G --> I
+    H --> I
+
+    I --> J[train_lgbm]
+    J --> K([MLflow\nartifacts])
 ```
 
 ### `inference_ptf_latest_pipeline`
@@ -73,24 +76,28 @@ fetch + process raw data
 
 Fetches live data, generates auxiliary predictions using pre-trained artifacts, builds PTF features, runs LightGBM inference, and produces decision signals and imbalance cost simulation for the latest day.
 
-```
-fetch + process raw data
-    │
-    ├── build_generation_features (inference_latest) ──► predict_generation_latest
-    ├── build_consumption_features (inference_latest) ──► predict_consumption_latest
-    └── build_smf_features (inference_latest) ──► predict_smf_latest
-                                                        │
-                                    process_market + process_weather
-                                                        │
-                                      build_features (ptf, inference_latest)
-                                                        │
-                                              predict_ptf_latest
-                                                        │
-                                      generate_ptf_decision_signals
-                                                        │
-                                        simulate_ptf_strategy
-                                                        │
-                                          evaluate_ptf_forecast
+```mermaid
+flowchart TD
+    A([fetch + process\nraw data])
+
+    A --> B[build_generation_features\ninference_latest]
+    A --> C[build_consumption_features\ninference_latest]
+    A --> D[build_smf_features\ninference_latest]
+    A --> H[process_market\nprocess_weather]
+
+    B --> E[predict_generation_latest]
+    C --> F[predict_consumption_latest]
+    D --> G[predict_smf_latest]
+
+    E --> I[build_features\nptf · inference_latest]
+    F --> I
+    G --> I
+    H --> I
+
+    I --> J[predict_ptf_latest]
+    J --> K[generate_ptf_decision_signals]
+    K --> L[simulate_ptf_strategy]
+    L --> M([evaluate_ptf_forecast])
 ```
 
 ### `inference_ptf_backfill_pipeline`
@@ -106,6 +113,34 @@ Same structure as the latest pipeline but supports three backfill modes passed v
 | `backfill_range` | Processes a specific range using `start_date` and `end_date` |
 
 > For `backfill_range`, both `start_date` and `end_date` are required — the pipeline exits with an error if either is missing.
+
+```mermaid
+flowchart TD
+    CONF([dag_run.conf\nmode · start_date · end_date])
+
+    CONF --> A
+
+    A([fetch + process\nraw data])
+
+    A --> B[build_generation_features\ninference_backfill]
+    A --> C[build_consumption_features\ninference_backfill]
+    A --> D[build_smf_features\ninference_backfill]
+    A --> H[process_market\nprocess_weather]
+
+    B --> E[predict_generation_backfill]
+    C --> F[predict_consumption_backfill]
+    D --> G[predict_smf_backfill]
+
+    E --> I[build_features\nptf · inference_backfill]
+    F --> I
+    G --> I
+    H --> I
+
+    I --> J[predict_ptf_backfill]
+    J --> K[generate_ptf_decision_signals]
+    K --> L[simulate_ptf_strategy]
+    L --> M([evaluate_ptf_backfill])
+```
 
 ## Repository structure
 
@@ -127,6 +162,8 @@ airflow/dags/
   retrain_ptf_pipeline.py
   inference_ptf_latest_pipeline.py
   inference_ptf_backfill_pipeline.py
+docs/
+  dashboard.png
 notebooks/          EDA · feature engineering · modelling experiments
 data/
   raw/              EPİAŞ, weather, generation, consumption, SMF raw feeds
@@ -176,26 +213,31 @@ streamlit run src/app/streamlit_app.py
 
 ## Workflow
 
-1. Fetch raw data — EPİAŞ PTF, weather, generation, consumption, SMF
-2. Process raw inputs and build the market feature file
-3. Build auxiliary features and generate auxiliary forecasts (generation, consumption, SMF)
-4. Build PTF features, filling missing external variables with auxiliary predictions
-5. Run LightGBM PTF inference
-6. Generate trading decision signals via `generate_signals.py`
-7. Run imbalance cost simulation via `simulate_imbalance_cost.py`
-8. Evaluate forecasts and monitor results in the Streamlit dashboard
+```mermaid
+flowchart LR
+    S1[1. Fetch raw data\nEPİAŞ · weather\ngeneration · consumption · SMF]
+    S2[2. Process inputs\nbuild market features]
+    S3[3. Aux features\n+ aux forecasts\ngeneration · consumption · SMF]
+    S4[4. Build PTF features\nfill missing externals\nwith aux predictions]
+    S5[5. LightGBM\nPTF inference]
+    S6[6. Decision signals\ngenerate_signals.py]
+    S7[7. Imbalance cost sim\nsimulate_imbalance_cost.py]
+    S8[8. Evaluate\n+ Streamlit dashboard]
+
+    S1 --> S2 --> S3 --> S4 --> S5 --> S6 --> S7 --> S8
+```
 
 ## Simulation parameters
 
 `simulate_imbalance_cost.py` applies the following strategy multipliers:
 
-| Position | Multiplier |
-|---|---|
-| high | 1.20 |
-| risky-high | 1.05 |
-| normal | 1.00 |
-| risky-low | 0.90 |
-| low | 0.80 |
+| Position | Multiplier | Description |
+|---|---|---|
+| `high` | 1.20 | Aggressive upward position |
+| `risky-high` | 1.05 | Moderate upward position |
+| `normal` | 1.00 | Neutral baseline |
+| `risky-low` | 0.90 | Moderate downward position |
+| `low` | 0.80 | Aggressive downward position |
 
 Fixed defaults: `--base-generation 100`, `--use-pred-as-ptf-fallback`, `--smf-from-ptf-multiplier 1.00`.
 
@@ -237,132 +279,3 @@ Trigger `inference_ptf_backfill_pipeline` from the Airflow UI with a JSON config
 ## License
 
 Use and adapt under your preferred project license.
-=======
-# Energy Market Analytics
-
-A modular energy market forecasting and decision-support repository focused on PTF-based price forecasting, ingestion pipelines, model training, evaluation, and deployable monitoring.
-
-## What it is
-
-- Ingests market, generation, consumption, SMF and weather data
-- Builds and trains PTF forecasting models, including conventional and LightGBM variants
-- Produces predictions, evaluation metrics, trading signals, and imbalance cost simulation
-- Orchestrates workflows with Docker, Airflow, and MLflow
-- Provides an interactive Streamlit dashboard for evaluation and signal inspection
-
-## Key components
-
-- `src/ingestion/` - data fetchers for consumption, EPİAŞ PTF, generation, SMF, and weather
-- `src/processing/` - data cleaning and feature processing modules
-- `src/forecasting/ptf/` - model training scripts for the PTF forecasting stack
-- `src/predict/` - prediction utilities for auxiliary series and model runtime inference
-- `src/decision/` - signal generation and imbalance cost simulation
-- `src/evalution/` - forecast evaluation logic and metrics
-- `src/app/` - Streamlit application for model monitoring and result analysis
-- `airflow/dags/` - production DAGs for inference and retraining pipelines
-- `notebooks/` - exploratory data analysis, feature engineering, and modeling experiments
-
-## Architecture
-
-```mermaid
-flowchart LR
-    A[Data Sources]
-    B[Ingestion]
-    C[Processing & Feature Engineering]
-    D[Training & MLflow]
-    E[Prediction & Signals]
-    F[Evaluation & Simulation]
-    G[Airflow Orchestration]
-    H[Streamlit Dashboard]
-
-    A --> B
-    B --> C
-    C --> D
-    C --> E
-    D --> E
-    E --> F
-    G --> B
-    G --> C
-    G --> D
-    G --> E
-    F --> H
-    E --> H
-    D --> H
-
-    subgraph repo [Repository]
-      B
-      C
-      D
-      E
-      F
-    end
-
-    subgraph infra [Deployment]
-      G
-      H
-    end
-```
-
-## Requirements
-
-- Python 3.x
-- `pip install -r requirements.txt`
-- Docker and Docker Compose for the Airflow/MLflow stack
-
-## Quick start
-
-1. Copy environment variables:
-
-```bash
-cp .env.example .env
-```
-
-2. Update `.env` with your local credentials and ports.
-
-3. Launch the stack:
-
-```bash
-docker compose up -d
-```
-
-4. Open services:
-
-- Airflow: `http://localhost:${AIRFLOW_PORT}`
-- MLflow: `http://localhost:${MLFLOW_PORT}`
-
-5. Run the dashboard locally:
-
-```bash
-streamlit run src/app/streamlit_app.py
-```
-
-## Local development
-
-- Install dependencies:
-
-```bash
-python -m pip install -r requirements.txt
-```
-
-- Run individual scripts or modules from `src/` for data ingestion, preprocessing, training, prediction, and evaluation.
-- Explore notebooks in `notebooks/` for data collection, EDA, feature engineering, and modeling.
-
-## Workflow overview
-
-1. Ingest raw market, generation, consumption, SMF and weather data
-2. Process raw inputs into training and inference features
-3. Train PTF forecasting models and register experiments in MLflow
-4. Produce forecasts and decision signals
-5. Evaluate results and simulate imbalance costs
-6. Orchestrate recurring pipelines with Airflow
-
-## Notes
-
-- `docker-compose.yml` defines PostgreSQL services for the warehouse and Airflow metadata, plus MLflow and Airflow containers.
-- `nginx/nginx.conf` can be used as a reverse proxy in deployment scenarios.
-- The repository uses `src/` as the main application package root.
-
-## License
-
-Use and adapt the code under your preferred project license.
->>>>>>> cf95cb432f9fee087c32969ef850b96dfe4723c0
