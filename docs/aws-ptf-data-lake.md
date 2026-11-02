@@ -68,7 +68,7 @@ Key layout (examples):
     s3://YOUR_PRIVATE_BUCKET/energy-market/raw/ptf/year=2026/month=11/chunk.parquet
     s3://YOUR_PRIVATE_BUCKET/energy-market/curated/ptf/ptf_processed.parquet
 
-The exporter uses deterministic object keys, so rerunning the same dataset overwrites the same keys instead of generating extra run-ID copies. It does not delete S3 data; if old raw files disappear locally, their old S3 copies remain until manually cleaned up. Partial uploads raise an error and require inspection/retry.
+The exporter uses deterministic object keys for each *local file name*: uploading the same file again overwrites its S3 object. However, EPİAŞ ingestion can create new raw part filenames containing overlapping hourly observations; the raw zone is not necessarily deduplicated. The future Glue ETL will deduplicate by timestamp. This exporter does not delete S3 data; if old raw files disappear locally, their old S3 copies remain until manually cleaned up. Partial uploads raise an error and require inspection/retry.
 
 ## Glue Data Catalog and Athena (manual, after S3 upload)
 
