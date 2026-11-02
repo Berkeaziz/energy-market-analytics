@@ -15,7 +15,7 @@ Extend the existing Energy Market Analytics portfolio project with a reproducibl
 
 ## Milestone 1: S3 → Glue Catalog → Athena
 - A standalone Python CLI plans and executes deterministic uploads, mapping `data/raw/epias/ptf_mcp/**/*.parquet` to `<prefix>/raw/ptf/...` and `data/processed/ptf/ptf_processed.parquet` to `<prefix>/curated/ptf/ptf_processed.parquet`.
-- Existing local files remain unchanged. Re-runs overwrite the same object keys (no duplicate data). No automated deletion.
+- Existing local files remain unchanged. Re-uploading a file with the same name overwrites its object key. EPİAŞ ingestion may create newly named raw Parquet files with overlapping hourly observations; the future Glue ETL must deduplicate by timestamp. No automated deletion.
 - `--dry-run` validates paths and prints the upload plan without AWS authentication or network operations.
 - No AWS upload is made automatically on import, Docker startup or DAG parse. A user explicitly runs the CLI.
 - Use boto3's normal credentials provider chain; never store API keys or EPİAŞ passwords in source, Docker images or documentation.
