@@ -16,7 +16,7 @@
 - Work only in `feat/aws-ptf-data-lake`, not `main`.
 - Map existing files, do not move or delete them.
 - Use existing boto3 credential-chain resolution, not hardcoded access keys.
-- Overwrite identical S3 keys on rerun rather than adding per-run duplicates.
+- Use the same S3 key when re-uploading a given local file path. Newly created EPİAŞ raw parts can still contain overlapping hourly observations; the future Glue ETL must deduplicate by timestamp.
 
 ## Review Focus
 1. Empty source or absent processed PTF file: fail clearly before any upload.
