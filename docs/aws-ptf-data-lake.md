@@ -4,8 +4,8 @@
 
 ## Data flow
 
-EPİAŞ API (existing local Airflow/Python) → local raw PTF Parquet → private Amazon S3 (\`energy-market/raw/ptf/\`)  
-Existing local processing → \`data/processed/ptf/ptf_processed.parquet\` → private Amazon S3 (\`energy-market/curated/ptf/\`) → AWS Glue Data Catalog → Athena SQL
+EPİAŞ API (existing local Airflow/Python) → local raw PTF Parquet → private Amazon S3 (`energy-market/raw/ptf/`)  
+Existing local processing → `data/processed/ptf/ptf_processed.parquet` → private Amazon S3 (`energy-market/curated/ptf/`) → AWS Glue Data Catalog → Athena SQL
 
 The first curated PTF export is one Parquet file. A managed AWS Glue transformation to partitioned curated data is a **later milestone** and must not be claimed as implemented.
 
@@ -41,10 +41,10 @@ Additional AWS CLI verification or Glue/Athena access may require separate read/
 
 The data directory is deliberately not committed to GitHub. First run the project's existing local ingestion and processing so these files are present:
 
-- \`data/raw/epias/ptf_mcp/**/*.parquet\`
-- \`data/processed/ptf/ptf_processed.parquet\`
+- `data/raw/epias/ptf_mcp/**/*.parquet`
+- `data/processed/ptf/ptf_processed.parquet`
 
-Install the project's dependencies (or just \`boto3\` for the exporter):
+Install the project's dependencies (or just `boto3` for the exporter):
 
     python -m pip install boto3
 
@@ -60,7 +60,7 @@ After confirming bucket policy, identity, cost controls, the data-sharing terms 
 
     python -m src.cloud.export_ptf_to_s3 --bucket YOUR_PRIVATE_BUCKET
 
-You can optionally pass \`--project-root PATH\` and \`--prefix energy-market\`.
+You can optionally pass `--project-root PATH` and `--prefix energy-market`.
 
 Key layout (examples):
 
@@ -71,11 +71,11 @@ The exporter uses deterministic object keys, so rerunning the same dataset overw
 
 ## Glue Data Catalog and Athena (manual, after S3 upload)
 
-1. In the AWS Glue console, create a database (for example, \`energy_market\`).
-2. Configure a crawler to scan only \`s3://YOUR_PRIVATE_BUCKET/energy-market/curated/ptf/\`. Use the same region as the bucket. Running a Glue crawler may incur costs.
-3. Run the crawler, then inspect the discovered table name and schema. Check the \`date\` field's inferred timestamp type and numeric PTF columns. Do not assume a table name until the crawler completes.
+1. In the AWS Glue console, create a database (for example, `energy_market`).
+2. Configure a crawler to scan only `s3://YOUR_PRIVATE_BUCKET/energy-market/curated/ptf/`. Use the same region as the bucket. Running a Glue crawler may incur costs.
+3. Run the crawler, then inspect the discovered table name and schema. Check the `date` field's inferred timestamp type and numeric PTF columns. Do not assume a table name until the crawler completes.
 4. Configure an Athena workgroup with a **private query-results S3 location** and, where supported, a per-query scan limit. Athena queries and result storage may incur costs.
-5. In Athena, select \`energy_market\` and the crawler-created table. Run small validation queries; for example, after replacing the table placeholder:
+5. In Athena, select `energy_market` and the crawler-created table. Run small validation queries; for example, after replacing the table placeholder:
 
        SELECT COUNT(*) AS n_rows FROM energy_market.YOUR_CRAWLED_TABLE;
        SELECT MIN(date) AS first_hour, MAX(date) AS last_hour
@@ -83,7 +83,7 @@ The exporter uses deterministic object keys, so rerunning the same dataset overw
        SELECT date, ptf FROM energy_market.YOUR_CRAWLED_TABLE
        ORDER BY date DESC LIMIT 10;
 
-6. Compare results against \`data/processed/ptf/ptf_processed.parquet\`: count, min/max timestamp, unique hourly records and selected PTF values. A successful local dry-run alone is not cloud validation.
+6. Compare results against `data/processed/ptf/ptf_processed.parquet`: count, min/max timestamp, unique hourly records and selected PTF values. A successful local dry-run alone is not cloud validation.
 
 ## Validation without cloud credentials
 
@@ -101,4 +101,4 @@ Tests cover deterministic key names, missing inputs, prefix validation, dry-run 
 
 ## Future milestone
 
-Implement an AWS Glue ETL job to transform raw PTF records into year/month-partitioned Parquet in S3; compare its results with local \`src/processing/process_ptf.py\`; then optionally add an Airflow trigger. Track this separately from the already testable uploader.
+Implement an AWS Glue ETL job to transform raw PTF records into year/month-partitioned Parquet in S3; compare its results with local `src/processing/process_ptf.py`; then optionally add an Airflow trigger. Track this separately from the already testable uploader.
