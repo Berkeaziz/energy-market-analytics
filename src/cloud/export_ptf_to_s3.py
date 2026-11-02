@@ -27,8 +27,9 @@ def _validate_prefix(prefix: str) -> str:
 def build_upload_plan(project_root: Path, prefix: str) -> list[tuple[Path, str]]:
     """Map existing PTF Parquet files to stable S3 object keys.
 
-    Repeated exports target the same keys and therefore never accumulate
-    additional per-run copies. No file is modified or deleted locally.
+    Re-exporting a file with the same local name targets the same S3 key.
+    New upstream raw parts can contain overlapping hourly observations.
+    No file is modified or deleted locally.
     """
     clean_prefix = _validate_prefix(prefix)
     root = Path(project_root)
