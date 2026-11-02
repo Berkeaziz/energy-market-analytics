@@ -279,3 +279,9 @@ Trigger `inference_ptf_backfill_pipeline` from the Airflow UI with a JSON config
 ## License
 
 Use and adapt under your preferred project license.
+
+## Optional AWS PTF Data Lake (Milestone 1)
+
+A test-covered, opt-in exporter can copy local EPİAŞ PTF Parquet data to a private Amazon S3 bucket. The next manual steps are Glue Data Catalog and Athena. **Cloud deployment has not been performed or verified yet.** The local Airflow/MLflow pipelines stay unchanged.
+
+See [AWS PTF Data Lake setup and validation](docs/aws-ptf-data-lake.md) for dry-run, cost controls, credentials and Athena checks.
