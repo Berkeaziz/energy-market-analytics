@@ -19,3 +19,4 @@ openpyxl
 tqdm
 optuna
 streamlit-autorefresh
+boto3
