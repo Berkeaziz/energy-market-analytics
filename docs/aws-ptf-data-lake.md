@@ -4,7 +4,8 @@
 
 ## Data flow
 
-EPİAŞ API (existing local Airflow/Python) → local raw PTF Parquet → private Amazon S3 (`energy-market/raw/ptf/`)  
+EPİAŞ API (existing local Airflow/Python) → local raw PTF Parquet → private Amazon S3 (`energy-market/raw/ptf/`)
+
 Existing local processing → `data/processed/ptf/ptf_processed.parquet` → private Amazon S3 (`energy-market/curated/ptf/`) → AWS Glue Data Catalog → Athena SQL
 
 The first curated PTF export is one Parquet file. A managed AWS Glue transformation to partitioned curated data is a **later milestone** and must not be claimed as implemented.
