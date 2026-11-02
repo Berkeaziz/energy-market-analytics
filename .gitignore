@@ -6,3 +6,8 @@
 /mlflow.db
 /.env
 /notebooks
+
+# Python tests and bytecode
+__pycache__/
+*.pyc
+.pytest_cache/
